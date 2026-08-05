@@ -67,13 +67,11 @@ for p in "$MAGISKTMP/magisk/su" "$MAGISKTMP/su" /system/bin/su /system/xbin/su; 
 done
 if [ -n "$MAGISK_SU" ]; then
     log "Magisk su: $MAGISK_SU"
-    for dest in "$TERMUX_DATA/files/usr/bin/su" \
-                "$TERMUX_DATA/files/usr/local/bin/su"; do
-        mkdir -p "$(dirname "$dest")"
-        mount --bind "$MAGISK_SU" "$dest" 2>/dev/null || {
-            cp "$MAGISK_SU" "$dest" && chmod 755 "$dest"
-        }
-    done
+    dest="$TERMUX_DATA/files/usr/local/bin/su"
+    mkdir -p "$(dirname "$dest")"
+    mount --bind "$MAGISK_SU" "$dest" 2>/dev/null || {
+        cp "$MAGISK_SU" "$dest" && chmod 755 "$dest"
+    }
 fi
 
 # --- Start magisk-proxy ---
