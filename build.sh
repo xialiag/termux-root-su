@@ -11,10 +11,7 @@ OUTDIR="build"
 ZIPFILE="${MODULE_NAME}-${VERSION}.zip"
 
 # --- Detect cross compiler ---
-if command -v aarch64-linux-android-gcc &>/dev/null; then
-    CC=aarch64-linux-android-gcc
-    STRIP=aarch64-linux-android-strip
-elif command -v aarch64-linux-gnu-gcc &>/dev/null; then
+if command -v aarch64-linux-gnu-gcc &>/dev/null; then
     CC=aarch64-linux-gnu-gcc
     STRIP=aarch64-linux-gnu-strip
 else
