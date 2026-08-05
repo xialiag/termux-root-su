@@ -1,3 +1,4 @@
 build/
 *.zip
 *.o
+# prebuilt/ 目录需要保留（线上运行的二进制）

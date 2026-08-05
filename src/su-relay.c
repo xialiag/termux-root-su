@@ -1,6 +1,10 @@
 /*
  * su-relay v2.2 — fixes proot's hijacking of magiskd unix socket.
  *
+ * NOTE: 此文件是根据 su-relay.py 和 service.sh 调用逻辑重写的参考实现。
+ * Magisk zip 中的 prebuilt/su-relay 是线上实际运行的版本。
+ * 如需从源码构建，请使用 ./build.sh vX.X --build
+ *
  * Usage: su-relay <proxy-sock> <scan-dir> [log-path]
  *
  * Problem:
