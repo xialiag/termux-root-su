@@ -1,0 +1,28 @@
+#!/sbin/sh
+# Magisk module installer
+# Minimal: just extract to module dir
+
+TMPDIR=/dev/tmp
+PERSISTDIR=/sbin/.magisk/mirror/persist
+
+print_modname() {
+  ui_print "*******************************"
+  ui_print "  Termux Root SU v2.0"
+  ui_print "*******************************"
+}
+
+on_install() {
+  ui_print "- Extracting module files"
+  unzip -o "$ZIPFILE" -d "$MODPATH" >&2
+  
+  # Remove installer metadata
+  rm -rf "$MODPATH/META-INF"
+}
+
+set_permissions() {
+  set_perm_recursive $MODPATH 0 0 0755 0644
+  set_perm $MODPATH/magisk-proxy 0 0 0755
+  set_perm $MODPATH/su-relay 0 0 0755
+  set_perm $MODPATH/service.sh 0 0 0755
+  [ -f "$MODPATH/boot-completed.sh" ] && set_perm $MODPATH/boot-completed.sh 0 0 0755
+}
