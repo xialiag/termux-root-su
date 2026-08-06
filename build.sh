@@ -17,10 +17,17 @@ for arg in "$@"; do
 done
 
 mkdir -p "${OUTDIR}"
+# Clean stale artifacts so leftovers from older builds never get packaged
+rm -f "${OUTDIR}/magisk-proxy" "${OUTDIR}/su-relay" "${OUTDIR}/su"
 
 if [ "$BUILD_FROM_SRC" = "1" ]; then
     # --- 从源码编译 ---
-    if command -v aarch64-linux-gnu-gcc &>/dev/null; then
+    # musl 优先: 静态 glibc 的 rseq 调用在部分 Android seccomp 策略下触发
+    # SIGSYS (Bad system call), musl 静态二进制无此问题。
+    if command -v musl-gcc &>/dev/null; then
+        CC=musl-gcc
+        STRIP=strip
+    elif command -v aarch64-linux-gnu-gcc &>/dev/null; then
         CC=aarch64-linux-gnu-gcc
         STRIP=aarch64-linux-gnu-strip
     else
@@ -31,7 +38,7 @@ if [ "$BUILD_FROM_SRC" = "1" ]; then
     echo "== Compiling ${MODULE_NAME} ${VERSION} from source =="
     echo "   CC=${CC}"
 
-    for src in magisk-proxy su-relay; do
+    for src in magisk-proxy su; do
         echo "   Compiling ${src}..."
         ${CC} -O2 -Wall -Wextra -static -o "${OUTDIR}/${src}" "src/${src}.c"
         ${STRIP} "${OUTDIR}/${src}" 2>/dev/null || true
@@ -39,29 +46,32 @@ if [ "$BUILD_FROM_SRC" = "1" ]; then
 else
     # --- 使用 prebuilt 二进制（与线上运行版本一致）---
     echo "== Packaging ${MODULE_NAME} ${VERSION} (prebuilt) =="
-    if [ ! -f prebuilt/magisk-proxy ] || [ ! -f prebuilt/su-relay ]; then
-        echo "ERROR: prebuilt/ 目录缺少二进制文件"
-        echo "  请先运行 './build.sh ${VERSION} --build' 从源码编译"
-        exit 1
-    fi
-    cp prebuilt/magisk-proxy "${OUTDIR}/magisk-proxy"
-    cp prebuilt/su-relay "${OUTDIR}/su-relay"
+    for bin in magisk-proxy su; do
+        if [ ! -f "prebuilt/${bin}" ]; then
+            echo "ERROR: prebuilt/ 目录缺少 ${bin}"
+            echo "  请先运行 './build.sh ${VERSION} --build' 从源码编译"
+            exit 1
+        fi
+        cp "prebuilt/${bin}" "${OUTDIR}/${bin}"
+    done
 fi
 
 echo "   Binaries:"
-ls -la "${OUTDIR}/magisk-proxy" "${OUTDIR}/su-relay"
+ls -la "${OUTDIR}/magisk-proxy" "${OUTDIR}/su"
 
 # --- Package zip ---
 echo "== Packaging ${ZIPFILE} =="
+rm -f "${ZIPFILE}"
 TMPDIR=$(mktemp -d)
 mkdir -p "${TMPDIR}/META-INF/com/google/android"
 
 cp module.prop "${TMPDIR}/"
 cp service.sh "${TMPDIR}/"
 cp boot-completed.sh "${TMPDIR}/"
+cp DEBUG_NOTES.md "${TMPDIR}/"
 cp META-INF/com/google/android/update-binary "${TMPDIR}/META-INF/com/google/android/"
 cp "${OUTDIR}/magisk-proxy" "${TMPDIR}/"
-cp "${OUTDIR}/su-relay" "${TMPDIR}/"
+cp "${OUTDIR}/su" "${TMPDIR}/"
 
 (cd "${TMPDIR}" && zip -r9 "${OLDPWD}/${ZIPFILE}" .)
 rm -rf "${TMPDIR}"

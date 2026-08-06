@@ -10,7 +10,7 @@ STRIP ?= aarch64-linux-gnu-strip
 SRCDIR = src
 OUTDIR = build
 
-TARGETS = $(OUTDIR)/magisk-proxy $(OUTDIR)/su-relay $(OUTDIR)/test-proxy-client
+TARGETS = $(OUTDIR)/magisk-proxy $(OUTDIR)/su
 
 .PHONY: all clean
 
@@ -19,10 +19,7 @@ all: $(TARGETS)
 $(OUTDIR)/magisk-proxy: $(SRCDIR)/magisk-proxy.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -o $@ $<
 
-$(OUTDIR)/su-relay: $(SRCDIR)/su-relay.c | $(OUTDIR)
-	$(CC) $(CFLAGS) -o $@ $<
-
-$(OUTDIR)/test-proxy-client: $(SRCDIR)/test-proxy-client.c | $(OUTDIR)
+$(OUTDIR)/su: $(SRCDIR)/su.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -o $@ $<
 
 $(OUTDIR):

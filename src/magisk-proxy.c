@@ -1,42 +1,47 @@
 /*
- * magisk-proxy v2.2 — spawns shells directly, bypasses magiskd check-client.
+ * magisk-proxy v3.3 — relay-based proxy for proot environments.
  *
- * Usage: magisk-proxy <proxy-sock> <real-sock> [log-path]
- *   (real-sock arg kept for CLI compat with service.sh, unused)
+ * Uses a simple frame protocol instead of SCM_RIGHTS.
+ * Frame: uint32 length, data[length].  length=0 means "end of relay".
+ * After end-of-relay frame: uint32 exit_code (raw, outside framing).
  *
- * Protocol (Magisk su client → daemon):
- *   int32  uid          (target uid, e.g. 0)
- *   int32  access       (0xffffffff = interactive/-1)
- *   uint8  mode         (0)
- *   uint8  login        (0)
- *   uint8  keepenv      (0)
- *   int32  shell_len
- *   char[] shell_path   (e.g. "/system/bin/sh")
- *   int32  cmd_len
- *   char[] cmd_data     (e.g. "id" for su -c 'id')
- *   int32  0            (terminator)
+ * v3.3: TCP loopback transport. Usage: magisk-proxy <port> [unused] [log-path]
+ *   A numeric <port> listens on 127.0.0.1:<port>. proot hijacks AF_UNIX
+ *   socket paths (virtual bind mounts + proot-* temp files), making unix
+ *   sockets unreachable from inside the container; TCP loopback has no
+ *   path translation and works through proot.
+ *   Non-numeric <port> keeps the legacy unix socket mode.
  *
- * Daemon → client:
- *   3× SCM_RIGHTS  (stdin pipe write-end, stdout pipe read-end, stderr pipe read-end)
- *   int32 child_pid
- *   [I/O through the 3 fds]
- *   int32 exit_code   (after child exits)
+ * Protocol:
+ *   1. Client → proxy:  uint32 cmd_len, char cmd[cmd_len]
+ *   2. Proxy → client:  uint32 child_pid
+ *   3. Proxy → client:  frames (uint32 len + data[len]) for stdout+stderr
+ *   4. Client → proxy:  raw stdin bytes (no framing needed)
+ *   5. When child exits: proxy sends uint32 0 (end marker) + uint32 exit_code
+ *   6. Connection closed
+ *
+ * Stdin is raw (no framing) because the proxy just pipes it to the child.
+ * Stdout/stderr uses frames so the client can distinguish data from exit_code.
  */
 
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <sys/uio.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <stdint.h>
+#include <signal.h>
 #include <time.h>
 #include <stdarg.h>
-#include <fcntl.h>
+#include <poll.h>
+
+#define RELAY_BUF_SIZE 4096
 
 static FILE *g_log = NULL;
 
@@ -60,24 +65,6 @@ static void log_msg(const char *fmt, ...) {
     va_end(ap);
 }
 
-/* Send a single fd via SCM_RIGHTS */
-static int send_fd(int sock, int fd_to_send) {
-    char cmsgbuf[CMSG_SPACE(sizeof(int))];
-    struct iovec iov = { .iov_base = "F", .iov_len = 1 };
-    struct msghdr msg = {
-        .msg_iov = &iov,
-        .msg_iovlen = 1,
-        .msg_control = cmsgbuf,
-        .msg_controllen = sizeof(cmsgbuf),
-    };
-    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-    *(int *)CMSG_DATA(cmsg) = fd_to_send;
-    return sendmsg(sock, &msg, 0);
-}
-
 /* Read exactly n bytes. Returns 0 on success, -1 on error/EOF. */
 static int xxread(int fd, void *buf, size_t n) {
     size_t done = 0;
@@ -89,27 +76,27 @@ static int xxread(int fd, void *buf, size_t n) {
     return 0;
 }
 
-/* Read a length-prefixed string. Caller must free(*out). Returns 0 on success. */
-static int read_lp_str(int fd, char **out) {
-    int32_t len;
-    if (xxread(fd, &len, 4) < 0) return -1;
-    if (len < 0 || len > 65536) return -1;
-    char *s = malloc(len + 1);
-    if (!s) return -1;
-    if (len > 0 && xxread(fd, s, len) < 0) { free(s); return -1; }
-    s[len] = '\0';
-    *out = s;
+/* Send a frame: uint32 length + data. Returns 0 on success. */
+static int send_frame(int fd, const void *data, uint32_t len) {
+    if (write(fd, &len, 4) != 4) return -1;
+    if (len > 0) {
+        size_t sent = 0;
+        while (sent < len) {
+            ssize_t w = write(fd, (const char *)data + sent, len - sent);
+            if (w <= 0) return -1;
+            sent += w;
+        }
+    }
     return 0;
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <proxy-sock> <real-sock> [log-path]\n", argv[0]);
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <proxy-sock> [unused] [log-path]\n", argv[0]);
         return 1;
     }
 
     const char *sock_path = argv[1];
-    /* argv[2] = real-sock (ignored — we don't relay to magiskd) */
     const char *log_path = argc > 3 ? argv[3] : NULL;
 
     if (log_path) {
@@ -119,21 +106,49 @@ int main(int argc, char *argv[]) {
         g_log = stderr;
     }
 
-    /* Create listening socket */
-    int srv = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (srv < 0) { log_msg("socket() failed: %s", strerror(errno)); return 1; }
+    signal(SIGPIPE, SIG_IGN);
+    /* Do NOT SIG_IGN SIGCHLD — waitpid needs the child exit status */
 
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
-    unlink(sock_path);
-    if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        log_msg("bind(%s) failed: %s", sock_path, strerror(errno));
-        return 1;
+    /* v3.3: TCP loopback mode — argv[1] as numeric port = 127.0.0.1:port.
+     * proot hijacks unix socket paths (virtual bind + proot-* temp files),
+     * which makes unix sockets unreachable from inside the container.
+     * TCP loopback has no path translation, so it works through proot.
+     * A non-numeric argv[1] falls back to legacy unix socket mode. */
+    char *end = NULL;
+    long port = strtol(sock_path, &end, 10);
+    int is_tcp = (sock_path[0] != '\0' && end != NULL && *end == '\0');
+
+    int srv;
+    if (is_tcp) {
+        srv = socket(AF_INET, SOCK_STREAM, 0);
+        if (srv < 0) { log_msg("socket() failed: %s", strerror(errno)); return 1; }
+        int one = 1;
+        setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        struct sockaddr_in addr = { .sin_family = AF_INET };
+        addr.sin_port = htons((uint16_t)port);
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            log_msg("bind(127.0.0.1:%ld) failed: %s", port, strerror(errno));
+            return 1;
+        }
+        listen(srv, 10);
+        log_msg("magisk-proxy v3.3 started (pid %d, uid %d) tcp=127.0.0.1:%ld",
+                getpid(), getuid(), port);
+    } else {
+        srv = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (srv < 0) { log_msg("socket() failed: %s", strerror(errno)); return 1; }
+        struct sockaddr_un addr = { .sun_family = AF_UNIX };
+        strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+        unlink(sock_path);
+        if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            log_msg("bind(%s) failed: %s", sock_path, strerror(errno));
+            return 1;
+        }
+        listen(srv, 10);
+        chmod(sock_path, 0666);
+        log_msg("magisk-proxy v3.3 started (pid %d, uid %d) sock=%s",
+                getpid(), getuid(), sock_path);
     }
-    listen(srv, 10);
-    chmod(sock_path, 0666);
-
-    log_msg("magisk-proxy started (pid %d, uid %d) sock=%s", getpid(), getuid(), sock_path);
 
     for (;;) {
         int cfd = accept(srv, NULL, NULL);
@@ -143,53 +158,52 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        /* === Read su_request === */
-        int32_t uid, access;
-        uint8_t mode, login, keepenv;
-        char *shell = NULL;
-        char *cmd = NULL;
-        int32_t terminator = -1;
-
-        if (xxread(cfd, &uid, 4) < 0 ||
-            xxread(cfd, &access, 4) < 0 ||
-            xxread(cfd, &mode, 1) < 0 ||
-            xxread(cfd, &login, 1) < 0 ||
-            xxread(cfd, &keepenv, 1) < 0 ||
-            read_lp_str(cfd, &shell) < 0 ||
-            read_lp_str(cfd, &cmd) < 0 ||
-            xxread(cfd, &terminator, 4) < 0) {
-            log_msg("failed to read su_request");
-            free(shell); free(cmd);
+        /* === Read cmd_len + cmd === */
+        uint32_t cmd_len;
+        if (xxread(cfd, &cmd_len, 4) < 0) {
+            log_msg("failed to read cmd_len");
             close(cfd);
             continue;
         }
 
-        log_msg("uid=%d access=%d shell=[%s] cmd=[%s]", uid, access, shell, cmd);
-
-        /* Default shell if empty */
-        if (!shell[0]) { free(shell); shell = strdup("/system/bin/sh"); }
-
-        /* === Create pipes for shell I/O === */
-        int stdin_pipe[2], stdout_pipe[2], stderr_pipe[2];
-        if (pipe(stdin_pipe) < 0 || pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
-            log_msg("pipe() failed: %s", strerror(errno));
-            free(shell); free(cmd); close(cfd);
+        char *cmd = NULL;
+        if (cmd_len > 0 && cmd_len < 65536) {
+            cmd = malloc(cmd_len + 1);
+            if (!cmd || xxread(cfd, cmd, cmd_len) < 0) {
+                log_msg("failed to read cmd (len=%u)", cmd_len);
+                free(cmd);
+                close(cfd);
+                continue;
+            }
+            cmd[cmd_len] = '\0';
+        } else if (cmd_len >= 65536) {
+            log_msg("cmd_len too large: %u", cmd_len);
+            close(cfd);
             continue;
         }
 
-        /* === Fork shell === */
+        log_msg("cmd=[%s] interactive=%d", cmd ? cmd : "", cmd_len == 0);
+
+        /* === Create pipes for child I/O === */
+        int stdin_pipe[2], stdout_pipe[2], stderr_pipe[2];
+        if (pipe(stdin_pipe) < 0 || pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
+            log_msg("pipe() failed: %s", strerror(errno));
+            free(cmd); close(cfd);
+            continue;
+        }
+
+        /* === Fork child === */
         pid_t child = fork();
         if (child < 0) {
             log_msg("fork() failed: %s", strerror(errno));
-            free(shell); free(cmd); close(cfd);
+            free(cmd); close(cfd);
             continue;
         }
 
         if (child == 0) {
-            /* --- Child process --- */
-            close(stdin_pipe[1]);   /* close write end of stdin */
-            close(stdout_pipe[0]);  /* close read end of stdout */
-            close(stderr_pipe[0]);  /* close read end of stderr */
+            close(stdin_pipe[1]);
+            close(stdout_pipe[0]);
+            close(stderr_pipe[0]);
             close(srv);
             close(cfd);
 
@@ -200,66 +214,119 @@ int main(int argc, char *argv[]) {
             close(stdout_pipe[1]);
             close(stderr_pipe[1]);
 
-            /* Drop to requested uid if running as root */
-            if (uid >= 0 && (uid_t)uid != getuid() && getuid() == 0) {
-                /* Set groups first (required before setuid) */
-                if (uid != 0) {
-                    (void)setgroups(0, NULL);
-                }
-                (void)setgid((gid_t)uid);
-                (void)setuid((uid_t)uid);
-            }
-
-            /* Build argv for exec:
-             * If cmd is non-empty: exec shell -c cmd
-             * If cmd is empty:     exec shell (interactive)
-             */
             if (cmd && cmd[0]) {
-                execl(shell, shell, "-c", cmd, (char *)NULL);
+                execl("/system/bin/sh", "sh", "-c", cmd, (char *)NULL);
             } else {
-                execl(shell, shell, (char *)NULL);
+                execl("/system/bin/sh", "sh", (char *)NULL);
             }
-            /* Fallback */
-            execl("/system/bin/sh", "sh", "-c", cmd ? cmd : "", (char *)NULL);
+            execl("/bin/sh", "sh", "-c", cmd ? cmd : "", (char *)NULL);
             _exit(127);
         }
 
-        /* --- Parent process --- */
+        /* --- Parent --- */
         close(stdin_pipe[0]);
         close(stdout_pipe[1]);
         close(stderr_pipe[1]);
 
-        /* Send 3 fds to client via SCM_RIGHTS:
-         *   fd 0: stdin  (write end — client writes → shell reads)
-         *   fd 1: stdout (read end  — shell writes → client reads)
-         *   fd 2: stderr (read end  — shell writes → client reads)
+        /* === Send child_pid === */
+        uint32_t child_pid = (uint32_t)child;
+        if (write(cfd, &child_pid, 4) != 4) {
+            log_msg("failed to send child_pid");
+            kill(child, SIGTERM);
+            close(stdin_pipe[1]); close(stdout_pipe[0]); close(stderr_pipe[0]);
+            close(cfd); free(cmd);
+            continue;
+        }
+
+        /* === Relay loop ===
+         * stdin: raw bytes from client → child stdin pipe
+         * stdout/stderr: framed data from child → client
          */
-        int fds_to_send[3] = { stdin_pipe[1], stdout_pipe[0], stderr_pipe[0] };
-        for (int i = 0; i < 3; i++) {
-            if (send_fd(cfd, fds_to_send[i]) < 0) {
-                log_msg("send_fd[%d] failed: %s", i, strerror(errno));
+        struct pollfd fds[3];
+        fds[0].fd = cfd;            fds[0].events = POLLIN;
+        fds[1].fd = stdout_pipe[0]; fds[1].events = POLLIN;
+        fds[2].fd = stderr_pipe[0]; fds[2].events = POLLIN;
+
+        int stdin_closed = 0;
+        int stdout_closed = 0, stderr_closed = 0;
+        int client_gone = 0;
+
+        while (!(stdout_closed && stderr_closed)) {
+            int ret = poll(fds, 3, 5000);
+            if (ret < 0) {
+                if (errno == EINTR) continue;
+                log_msg("poll: %s", strerror(errno));
+                break;
+            }
+
+            /* Client → child stdin (raw, no framing) */
+            if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
+                char buf[RELAY_BUF_SIZE];
+                ssize_t n = read(cfd, buf, sizeof(buf));
+                if (n < 0) {
+                    client_gone = 1;
+                    if (!stdin_closed) { close(stdin_pipe[1]); stdin_closed = 1; }
+                    fds[0].fd = -1; fds[0].events = 0;
+                } else if (n == 0) {
+                    /* Client done writing (shutdown SHUT_WR) */
+                    if (!stdin_closed) { close(stdin_pipe[1]); stdin_closed = 1; }
+                    fds[0].fd = -1; fds[0].events = 0;
+                } else if (!stdin_closed) {
+                    ssize_t w = write(stdin_pipe[1], buf, n);
+                    if (w < 0 && errno == EPIPE) {
+                        close(stdin_pipe[1]); stdin_closed = 1;
+                    }
+                }
+            }
+
+            /* Child stdout → client (framed) */
+            if (fds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
+                char buf[RELAY_BUF_SIZE];
+                ssize_t n = read(stdout_pipe[0], buf, sizeof(buf));
+                if (n <= 0) {
+                    stdout_closed = 1;
+                    fds[1].fd = -1; fds[1].events = 0;
+                } else if (!client_gone) {
+                    if (send_frame(cfd, buf, (uint32_t)n) < 0)
+                        client_gone = 1;
+                }
+            }
+
+            /* Child stderr → client (framed) */
+            if (fds[2].revents & (POLLIN | POLLHUP | POLLERR)) {
+                char buf[RELAY_BUF_SIZE];
+                ssize_t n = read(stderr_pipe[0], buf, sizeof(buf));
+                if (n <= 0) {
+                    stderr_closed = 1;
+                    fds[2].fd = -1; fds[2].events = 0;
+                } else if (!client_gone) {
+                    if (send_frame(cfd, buf, (uint32_t)n) < 0)
+                        client_gone = 1;
+                }
             }
         }
 
-        /* Send child pid */
-        (void)write(cfd, &child, sizeof(child));
+        if (!stdin_closed) close(stdin_pipe[1]);
+        if (!stdout_closed) close(stdout_pipe[0]);
+        if (!stderr_closed) close(stderr_pipe[0]);
 
-        /* Close our copies of the pipe fds (client has them now) */
-        close(stdin_pipe[1]);
-        close(stdout_pipe[0]);
-        close(stderr_pipe[0]);
-
-        /* Wait for child and send exit code */
+        /* === Wait for child and get exit code === */
         int status;
         waitpid(child, &status, 0);
         int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
-        (void)write(cfd, &exit_code, sizeof(exit_code));
-
         log_msg("child %d exited with code %d", child, exit_code);
 
-        free(shell);
-        free(cmd);
+        if (!client_gone) {
+            /* Send end-of-relay frame (length=0) + exit_code */
+            uint32_t zero = 0;
+            ssize_t w1 = write(cfd, &zero, 4);
+            ssize_t w2 = write(cfd, &exit_code, 4);
+            if (w1 < 0 || w2 < 0)
+                log_msg("failed to send exit_code frame");
+        }
+
         close(cfd);
+        free(cmd);
     }
 
     return 0;

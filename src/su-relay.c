@@ -1,5 +1,5 @@
 /*
- * su-relay v2.2 — fixes proot's hijacking of magiskd unix socket.
+ * su-relay v3.2 — fixes proot's hijacking of unix sockets.
  *
  * NOTE: 此文件是根据 su-relay.py 和 service.sh 调用逻辑重写的参考实现。
  * Magisk zip 中的 prebuilt/su-relay 是线上实际运行的版本。
@@ -9,15 +9,20 @@
  *
  * Problem:
  *   proot bind-mounts host paths into the container. When it encounters a
- *   unix socket (e.g. /debug_ramdisk/.magisk/device/socket), it creates a
- *   temp file on the host (proot-<pid>-XXXXXX) and bind-mounts that into
- *   the container. The temp file is not a socket, so connect() fails ENOENT.
+ *   unix socket, it creates a temp file on the host (proot-<pid>-XXXXXX)
+ *   and bind-mounts that into the container.  The temp file is not a socket,
+ *   so connect() fails ENOENT.
  *
  * Solution:
  *   This daemon scans /proc/self/mountinfo for proot-* temp files that are
- *   mounted at .magisk/device/socket paths, then replaces them with a
- *   symlink to the proxy socket. The su client's connect() is then resolved
- *   by the kernel through the symlink to the real proxy socket.
+ *   mounted at .magisk/device/socket paths OR the proxy socket path, then
+ *   replaces them with a symlink to the proxy socket.  The su client's
+ *   connect() is then resolved by the kernel through the symlink to the
+ *   real proxy socket.
+ *
+ * v3.2: Also patches the proxy socket path (not just .magisk/device/socket)
+ * so the custom su client's direct connection works through proot.
+ * Processes all poisoned sources, not just the first one.
  *
  * Why not relay (forward) connections?
  *   magiskd's check-client gate uses SO_PEERCRED to verify the connecting
@@ -61,8 +66,8 @@ static void log_msg(const char *fmt, ...) {
 
 /*
  * Parse mountinfo and return proot temp file sources that are mounted
- * at .magisk/device/socket paths. Caller frees the returned array.
- * Returns count of sources found (0 if none).
+ * at either .magisk/device/socket paths OR the proxy socket path.
+ * Caller frees the returned array.  Returns count of sources found (0 if none).
  */
 static int find_poisoned_sources(char sources[][MAX_LINE], int max) {
     FILE *f = fopen(MOUNTINFO, "r");
@@ -107,10 +112,12 @@ static int find_poisoned_sources(char sources[][MAX_LINE], int max) {
             tok = strtok_r(NULL, " \t\n", &saveptr);
         }
 
-        /* Check: mount_point ends with .magisk/device/socket
+        /* Check: mount_point contains .magisk/device/socket
+         * OR the proxy socket filename (magisk-proxy.sock)
          * AND source starts with proot temp dir prefix */
         if (!mount_point[0] || !source[0]) continue;
-        if (!strstr(mount_point, ".magisk/device/socket")) continue;
+        if (!strstr(mount_point, ".magisk/device/socket") &&
+            !strstr(mount_point, "magisk-proxy.sock")) continue;
         if (strncmp(source, "/data/data/com.termux/files/usr/tmp/proot-", 43) != 0 &&
             strncmp(source, "/data/user/0/com.termux/files/usr/tmp/proot-", 45) != 0) {
             /* Also check g_scan_dir prefix if set */
@@ -151,7 +158,6 @@ int main(int argc, char *argv[]) {
             getpid(), g_proxy_sock, g_scan_dir);
 
     char sources[MAX_SOURCES][MAX_LINE];
-    char fixed[MAX_LINE] = "";
 
     for (;;) {
         int n = find_poisoned_sources(sources, MAX_SOURCES);
@@ -160,16 +166,23 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        /* Process first source (typically only one per proot instance) */
-        if (strcmp(sources[0], fixed) != 0) {
-            /* Remove stale file (placeholder / old socket / old symlink) */
-            unlink(sources[0]);
+        for (int i = 0; i < n; i++) {
+            /* Skip if already a symlink pointing to proxy socket */
+            char link_target[MAX_LINE];
+            ssize_t len = readlink(sources[i], link_target, sizeof(link_target) - 1);
+            if (len > 0) {
+                link_target[len] = '\0';
+                if (strcmp(link_target, g_proxy_sock) == 0)
+                    continue;
+            }
 
-            if (symlink(g_proxy_sock, sources[0]) == 0) {
-                snprintf(fixed, sizeof(fixed), "%s", sources[0]);
-                log_msg("symlink %s -> %s", sources[0], g_proxy_sock);
+            /* Remove stale file (placeholder / old socket / old symlink) */
+            unlink(sources[i]);
+
+            if (symlink(g_proxy_sock, sources[i]) == 0) {
+                log_msg("symlink %s -> %s", sources[i], g_proxy_sock);
             } else {
-                log_msg("symlink %s failed: %s", sources[0], strerror(errno));
+                log_msg("symlink %s failed: %s", sources[i], strerror(errno));
             }
         }
 

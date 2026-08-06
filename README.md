@@ -21,7 +21,7 @@ uid=0(root) gid=0(root) groups=0(root) context=u:r:magisk:s0
 
 ### 方法一：Magisk 管理器刷入（推荐）
 
-1. 从 [Releases](https://github.com/alikz10613/termux-root-su/releases) 下载最新 `termux-root-su-vX.X.zip`
+1. 从 [Releases](https://github.com/xialiag/termux-root-su/releases) 下载最新 `termux-root-su-vX.X.zip`
 2. 打开 Magisk 管理器 → 模块 → 从本地安装
 3. 选择下载的 zip 文件
 4. 重启设备
@@ -39,7 +39,7 @@ su -c reboot
 ### 从源码构建
 
 ```bash
-git clone https://github.com/alikz10613/termux-root-su.git
+git clone https://github.com/xialiag/termux-root-su.git
 cd termux-root-su
 
 # 使用 Android NDK 交叉编译器
@@ -48,8 +48,8 @@ make CC=aarch64-linux-android-gcc
 # 或使用 GNU 工具链
 make CC=aarch64-linux-gnu-gcc
 
-# 打包 zip
-./build.sh v2.2
+# 打包 zip（--build 从源码编译，不加则用 prebuilt 二进制）
+./build.sh v2.5 --build
 ```
 
 ## 使用方法
@@ -174,11 +174,20 @@ symlink 由内核透明解析，`getpeercred()` 返回的是**客户端自己的
 4. bind mount Magisk su 到 proot 容器的 `/usr/bin/su` 和 `/usr/local/bin/su`
 5. 启动 `magisk-proxy` 和 `su-relay`
 
-### su 协议详解
+### su 协议详解（Magisk v5）
 
-Magisk su 客户端和 daemon 之间使用自定义二进制协议：
+Magisk su 客户端和 daemon 之间使用自定义二进制协议，包含版本握手：
 
-**客户端 → daemon：**
+**阶段 1：版本握手**
+```
+客户端 → daemon:  int32   version         # 当前为 5
+daemon → 客户端:  int32   policy          # 0=ALLOW, 1=DENY, 2=INTERACTIVE
+```
+
+> **v2.5 关键修复**：policy 必须写 4 字节 `int32_t`。之前写 `uint8_t`(1 字节)，
+> 客户端读 4 字节时吃掉了 su_request 的前 3 字节，导致协议错位 → `failed to read su_request`。
+
+**阶段 2：su_request（客户端 → daemon）**
 ```
 int32   uid           # 目标 uid（0 = root）
 int32   access        # 0xffffffff = interactive
@@ -189,10 +198,17 @@ int32   shell_len
 char[]  shell_path    # e.g. "/system/bin/sh"
 int32   cmd_len
 char[]  cmd_data      # e.g. "id" for su -c 'id'
-int32   0             # terminator
+
+# 环境变量（len=0 结束，非 terminator）
+[int32  env_len]      # >0 时读 env_len 字节
+[char[] env_data]     # 重复直到 env_len == 0
+
+int32   target_selector
+int32   mount_ns
+int32   nice
 ```
 
-**daemon → 客户端：**
+**阶段 3：shell I/O（daemon → 客户端）**
 ```
 SCM_RIGHTS × 3        # stdin(write-end), stdout(read-end), stderr(read-end)
 int32   child_pid     # 子进程 PID
@@ -245,6 +261,11 @@ cat /data/data/com.termux/files/usr/tmp/su-relay.log
 **`Accessed denied`**
 - su 二进制是副本而非 bind mount（exe 不匹配）
 - 检查 `ls -la /usr/local/bin/su`，应指向 Magisk su
+
+**`failed to read su_request`（proxy 日志）**
+- v2.4 及更早版本的 bug：policy 响应写 1 字节，客户端期望 4 字节，协议错位
+- 升级到 v2.5+ 即可修复
+- 如果日志显示 `client version: 5` 后紧跟此错误，确认二进制已更新
 
 **重启后失效**
 - `boot-completed.sh` 会自动检查并重启服务

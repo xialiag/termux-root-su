@@ -1,6 +1,6 @@
 #!/system/bin/sh
-# termux-root-su v2.1 boot-completed.sh
-# Fallback: check if proxy is running, restart if needed.
+# termux-root-su v3.4 boot-completed.sh
+# Fallback: check if proxy is listening, restart if needed.
 # Runs once after boot is fully complete.
 
 MODDIR="${0%/*}"
@@ -8,7 +8,7 @@ LOG="/data/local/tmp/termux-root-su.log"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [boot-completed] $*" >> "$LOG"; }
 
-# Check if proxy is already running (CE may still be locking)
+# Wait for Termux CE unlock
 TERMUX_DATA=""
 for i in $(seq 1 30); do
     for d in /data/data/com.termux /data/user/0/com.termux; do
@@ -19,22 +19,21 @@ for i in $(seq 1 30); do
 done
 [ -z "$TERMUX_DATA" ] && exit 0
 
-PROXY_SOCK="$TERMUX_DATA/files/usr/tmp/magisk-proxy.sock"
-if [ -S "$PROXY_SOCK" ]; then
-    # Proxy socket exists, check if someone's listening
-    # (service.sh already started everything)
-    log "proxy socket exists, checking relay..."
-    
-    # Check if su-relay is running
-    if ! pgrep -f "su-relay" >/dev/null 2>&1; then
-        log "su-relay not running, restarting service.sh"
-        exec "$MODDIR/service.sh"
+PORT_FILE="$TERMUX_DATA/files/usr/tmp/magisk-proxy.port"
+PORT=$(cat "$PORT_FILE" 2>/dev/null)
+if [ -n "$PORT" ]; then
+    HEX=$(printf '%04X' "$PORT")
+    if grep -q ":$HEX " /proc/net/tcp 2>/dev/null; then
+        log "proxy already running on port $PORT"
+        exit 0
     fi
-    
-    log "all good"
+fi
+
+# Proxy dead — if the watchdog script is deployed it will restart it within 15s
+if [ -x "$TERMUX_DATA/files/usr/tmp/magisk-proxy-watchdog.sh" ]; then
+    log "proxy not listening, watchdog present (will restart); skipping service.sh"
     exit 0
 fi
 
-# Proxy not running, restart everything
 log "proxy not running, restarting service.sh"
 exec "$MODDIR/service.sh"
