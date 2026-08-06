@@ -1,17 +1,48 @@
 # termux-root-su 开发记忆
 
-## 当前状态 (v3.4, 2026-08-06)
-- **Bad system call 根因已定位并修复**: 静态 glibc 的 rseq syscall 在部分
-  seccomp 策略下触发 SIGSYS。v3.4 改用 musl 静态编译, 免疫。
-- **proxy 死后自动重启**: service.sh 启动 watchdog (每 15s 查 /proc/net/tcp)。
-- **su 部署进 proot rootfs**: service.sh 遍历 containers/*/rootfs 部署。
-- **容器内端口发现修复 (v3.4 二次修订, versionCode 341)**:
-  - 容器内读不到宿主端口文件 → su 扫描 48000-48019 (hint 优先)。
-  - 每个候选 1s 握手超时, 死监听者 (accept 但不应答) 快速跳过。
-  - service.sh 把端口文件同步到 rootfs/tmp/magisk-proxy.port (容器内可见)。
-  - 本机端到端验证: 死端口 48000 + proxy 48001 → su 0.2s 命中 48001, uid=0。
-- 手机上 v3.3 的 proxy 实际活着 (18:16 boot 时 service.sh 成功, magisk 域内
-  进程容器内 ps 不可见), "proxy 没跑" 是用户侧旧检测结果; v3.4 已加守护。
+## 当前状态 (v3.5, 2026-08-06)
+- **交互式 su 修复**: proxy 用 forkpty 给 child 真实 pty,提示符/回显/
+  Ctrl+C 全部正常(v3.4 的 pipe 方案导致"无输出、退不出")。
+- **connect 非阻塞超时**: 死监听者吞 SYN 时阻塞 connect 可挂 32s+,
+  现在每个端口最多 1s。
+- **proxy 防阻塞**: 客户端死后 kill child + idle 兜底,accept 循环永不卡。
+- v3.4 的 musl 静态编译、端口扫描、watchdog 均保留。
+
+## v3.5 交互式 su 挂死完整排查记忆 (2026-08-06)
+
+### 现象
+- 容器内 `su`(交互式)无输出,Ctrl+C 无法退出;`su -c 'cmd'` 正常
+  (能输出 uid=0)。用户刷 v3.4 后仍未解决。
+
+### 根因 (两层)
+1. **proxy 用 pipe 给 child**: sh 的 stdin/stdout 是 pipe 而非 tty →
+   sh 以非交互模式运行: 无提示符、无回显。
+2. **su 客户端 raw mode 清除本地 ISIG**: 终端 Ctrl+C 不再产生 SIGINT,
+   变成 0x03 字节经 socket 发给 proxy 的 sh;非交互 sh(pipe stdin)
+   忽略 0x03 → 无法中断、无法退出。
+
+### 修复
+- proxy 交互模式(cmd_len==0)用 `forkpty(&master, ...)` 替换
+  pipe+fork: child 的 stdin/stdout/stderr 是 pty slave,sh 检测到
+  tty 进入交互模式;提示符/回显/ISIG 由 pty 驱动完成,Ctrl+C 字节
+  写入 master 后 pty 驱动转成 SIGINT 发给 sh。
+- 客户端断开保护:
+  - send_frame 失败(客户端 socket 消失)→ kill(child, SIGTERM)
+  - stdin EOF 后 idle 超时: 交互 10s / 非交互 60s kill 失控 child
+    (如 `su -c 'sleep 30'` 客户端被杀后 child 继续跑,waitpid 会
+    阻塞 accept 循环)。
+- su 客户端 connect 改非阻塞 + poll 1s: 死监听者(吞 SYN/accept 后
+  不应答)不再拖住整个扫描。实测 48000 死监听时从 32s+ 降到 1.1s。
+
+### 验证方法
+- 交互: python pty.fork() 驱动 su,检查提示符、回显、`sleep 30` +
+  `\x03` → `^C` + exit 130、中断后 shell 存活、exit 退出。
+- 防阻塞: `timeout 2 su -c 'sleep 30'` 杀掉客户端后,新连接应
+  立即可用(proxy 不再 waitpid 阻塞)。
+- 死监听: python 建一个 accept 后不响应的 socket,su 应 1s 内跳过。
+
+## 待办
+- [ ] 用户刷入 v3.5 验证 (交互式 su: 提示符/Ctrl+C/exit; -c 模式)
 
 ## v3.4 Bad system call (SIGSYS) 完整排查记忆 (2026-08-06)
 

@@ -1,5 +1,28 @@
 # CHANGELOG
 
+## v3.5 (2026-08-06)
+- **修复交互式 `su` 无输出、Ctrl+C 无法退出**:proxy 对交互会话
+  (cmd_len==0) 改用 `forkpty` 给 child 分配真实 pty。
+  - 根因: 旧版用 pipe 给 child,sh 以非交互模式运行 —— 无提示符、
+    无回显;su 客户端 raw mode 清除了本地 ISIG,Ctrl+C 变成 0x03 字节
+    发给管道另一端的非交互 sh,sh 忽略 → 会话看起来"死了",且
+    Ctrl+C 无法中断。
+  - 修复后: sh 有控制终端,提示符/回显/ISIG 全由 pty 驱动提供,
+    Ctrl+C → SIGINT 中断当前命令,shell 保持;exit/^D 正常退出。
+  - 验证: python pty 驱动实测 —— 启动提示符、命令回显、sleep 30 +
+    Ctrl+C → `^C` + exit 130、中断后 shell 仍活、exit 干净退出。
+- **修复 su 扫描端口时被"吞 SYN 的死监听者"卡死**:阻塞式 connect()
+  遇到 accept 但不应答/不响应 SYN 的残留监听者时,内核重试可挂
+  数十秒(实测 48000 死监听 → 32s 后才扫到 48009)。connect 改为
+  非阻塞 + 1s poll 超时,每个端口最多 1s,扫描总时间有界。
+- **修复客户端断开后 proxy 阻塞 accept 循环**:客户端死亡而 child
+  继续运行(如 `su -c 'sleep 30'` 被 kill)时,旧代码在 waitpid 上
+  阻塞,整个 proxy 无法接受新连接。现在:
+  - send_frame 失败(客户端彻底消失)立即 kill child;
+  - stdin EOF 后 idle 超时兜底: 交互 10s / 非交互 60s kill 失控
+    child。
+  - 验证: 客户端被杀后 ~2s 内新连接正常服务。
+
 ## v3.4 (2026-08-06)
 - **修复容器内 su 连不上 proxy（端口发现）**: proot 容器内通常看不到宿主路径
   `/data/data/com.termux/files/usr/tmp/magisk-proxy.port`，旧版 su 只能回退

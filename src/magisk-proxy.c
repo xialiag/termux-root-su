@@ -1,9 +1,15 @@
 /*
- * magisk-proxy v3.3 — relay-based proxy for proot environments.
+ * magisk-proxy v3.5 — relay-based proxy for proot environments.
  *
  * Uses a simple frame protocol instead of SCM_RIGHTS.
  * Frame: uint32 length, data[length].  length=0 means "end of relay".
  * After end-of-relay frame: uint32 exit_code (raw, outside framing).
+ *
+ * v3.5: interactive sessions (cmd_len == 0) give the child a real pty via
+ *   forkpty. With plain pipes the shell runs non-interactively: no prompt,
+ *   no echo, and Ctrl+C (0x03) is just a byte to a pipe-reading sh — the
+ *   session looks dead and cannot be interrupted. With a pty the tty
+ *   driver provides prompt/echo and turns Ctrl+C into SIGINT to the shell.
  *
  * v3.3: TCP loopback transport. Usage: magisk-proxy <port> [unused] [log-path]
  *   A numeric <port> listens on 127.0.0.1:<port>. proot hijacks AF_UNIX
@@ -40,6 +46,7 @@
 #include <time.h>
 #include <stdarg.h>
 #include <poll.h>
+#include <pty.h>
 
 #define RELAY_BUF_SIZE 4096
 
@@ -132,7 +139,7 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         listen(srv, 10);
-        log_msg("magisk-proxy v3.3 started (pid %d, uid %d) tcp=127.0.0.1:%ld",
+        log_msg("magisk-proxy v3.5 started (pid %d, uid %d) tcp=127.0.0.1:%ld",
                 getpid(), getuid(), port);
     } else {
         srv = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -146,7 +153,7 @@ int main(int argc, char *argv[]) {
         }
         listen(srv, 10);
         chmod(sock_path, 0666);
-        log_msg("magisk-proxy v3.3 started (pid %d, uid %d) sock=%s",
+        log_msg("magisk-proxy v3.5 started (pid %d, uid %d) sock=%s",
                 getpid(), getuid(), sock_path);
     }
 
@@ -182,81 +189,148 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        log_msg("cmd=[%s] interactive=%d", cmd ? cmd : "", cmd_len == 0);
+        int interactive = (cmd_len == 0);
+        log_msg("cmd=[%s] interactive=%d", cmd ? cmd : "", interactive);
 
-        /* === Create pipes for child I/O === */
+        int master = -1;
         int stdin_pipe[2], stdout_pipe[2], stderr_pipe[2];
-        if (pipe(stdin_pipe) < 0 || pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
-            log_msg("pipe() failed: %s", strerror(errno));
-            free(cmd); close(cfd);
-            continue;
-        }
+        pid_t child;
 
-        /* === Fork child === */
-        pid_t child = fork();
-        if (child < 0) {
-            log_msg("fork() failed: %s", strerror(errno));
-            free(cmd); close(cfd);
-            continue;
-        }
+        if (interactive) {
+            /* === Interactive session: real pty for the child ===
+             * With pipes the shell runs non-interactively (no prompt, no
+             * echo; Ctrl+C is a raw byte a pipe-reading sh ignores) — the
+             * session looks dead and cannot be interrupted. forkpty gives
+             * the shell a controlling terminal so prompt/echo/ISIG work. */
+            struct winsize ws;
+            memset(&ws, 0, sizeof(ws));
+            ws.ws_row = 24;
+            ws.ws_col = 80;
+            child = forkpty(&master, NULL, NULL, &ws);
+            if (child < 0) {
+                log_msg("forkpty() failed: %s", strerror(errno));
+                free(cmd); close(cfd);
+                continue;
+            }
+            if (child == 0) {
+                close(srv);
+                close(cfd);
+                /* stdin/stdout/stderr already on the pty slave */
+                if (cmd && cmd[0]) {
+                    execl("/system/bin/sh", "sh", "-c", cmd, (char *)NULL);
+                } else {
+                    execl("/system/bin/sh", "sh", (char *)NULL);
+                }
+                execl("/bin/sh", "sh", "-c", cmd ? cmd : "", (char *)NULL);
+                _exit(127);
+            }
+        } else {
+            /* === Non-interactive: pipes for child I/O === */
+            if (pipe(stdin_pipe) < 0 || pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
+                log_msg("pipe() failed: %s", strerror(errno));
+                free(cmd); close(cfd);
+                continue;
+            }
 
-        if (child == 0) {
-            close(stdin_pipe[1]);
-            close(stdout_pipe[0]);
-            close(stderr_pipe[0]);
-            close(srv);
-            close(cfd);
+            child = fork();
+            if (child < 0) {
+                log_msg("fork() failed: %s", strerror(errno));
+                free(cmd); close(cfd);
+                continue;
+            }
 
-            dup2(stdin_pipe[0], STDIN_FILENO);
-            dup2(stdout_pipe[1], STDOUT_FILENO);
-            dup2(stderr_pipe[1], STDERR_FILENO);
+            if (child == 0) {
+                close(stdin_pipe[1]);
+                close(stdout_pipe[0]);
+                close(stderr_pipe[0]);
+                close(srv);
+                close(cfd);
+
+                dup2(stdin_pipe[0], STDIN_FILENO);
+                dup2(stdout_pipe[1], STDOUT_FILENO);
+                dup2(stderr_pipe[1], STDERR_FILENO);
+                close(stdin_pipe[0]);
+                close(stdout_pipe[1]);
+                close(stderr_pipe[1]);
+
+                if (cmd && cmd[0]) {
+                    execl("/system/bin/sh", "sh", "-c", cmd, (char *)NULL);
+                } else {
+                    execl("/system/bin/sh", "sh", (char *)NULL);
+                }
+                execl("/bin/sh", "sh", "-c", cmd ? cmd : "", (char *)NULL);
+                _exit(127);
+            }
+
+            /* --- Parent --- */
             close(stdin_pipe[0]);
             close(stdout_pipe[1]);
             close(stderr_pipe[1]);
-
-            if (cmd && cmd[0]) {
-                execl("/system/bin/sh", "sh", "-c", cmd, (char *)NULL);
-            } else {
-                execl("/system/bin/sh", "sh", (char *)NULL);
-            }
-            execl("/bin/sh", "sh", "-c", cmd ? cmd : "", (char *)NULL);
-            _exit(127);
         }
-
-        /* --- Parent --- */
-        close(stdin_pipe[0]);
-        close(stdout_pipe[1]);
-        close(stderr_pipe[1]);
 
         /* === Send child_pid === */
         uint32_t child_pid = (uint32_t)child;
         if (write(cfd, &child_pid, 4) != 4) {
             log_msg("failed to send child_pid");
             kill(child, SIGTERM);
-            close(stdin_pipe[1]); close(stdout_pipe[0]); close(stderr_pipe[0]);
+            if (interactive) {
+                close(master);
+            } else {
+                close(stdin_pipe[1]); close(stdout_pipe[0]); close(stderr_pipe[0]);
+            }
             close(cfd); free(cmd);
             continue;
         }
 
         /* === Relay loop ===
-         * stdin: raw bytes from client → child stdin pipe
+         * stdin: raw bytes from client → child (pipe or pty master)
          * stdout/stderr: framed data from child → client
+         * Interactive: one stream (pty master); non-interactive: two pipes.
          */
         struct pollfd fds[3];
         fds[0].fd = cfd;            fds[0].events = POLLIN;
-        fds[1].fd = stdout_pipe[0]; fds[1].events = POLLIN;
-        fds[2].fd = stderr_pipe[0]; fds[2].events = POLLIN;
+        if (interactive) {
+            fds[1].fd = master;     fds[1].events = POLLIN;
+            fds[2].fd = -1;         fds[2].events = 0;
+        } else {
+            fds[1].fd = stdout_pipe[0]; fds[1].events = POLLIN;
+            fds[2].fd = stderr_pipe[0]; fds[2].events = POLLIN;
+        }
 
         int stdin_closed = 0;
         int stdout_closed = 0, stderr_closed = 0;
         int client_gone = 0;
+        int idle_timeouts = 0;
 
-        while (!(stdout_closed && stderr_closed)) {
-            int ret = poll(fds, 3, 5000);
+        while (interactive ? !stdout_closed : !(stdout_closed && stderr_closed)) {
+            int nfds = interactive ? 2 : 3;
+            int ret = poll(fds, nfds, 5000);
             if (ret < 0) {
                 if (errno == EINTR) continue;
                 log_msg("poll: %s", strerror(errno));
                 break;
+            }
+            if (ret == 0) {
+                /* No activity. If the client already disconnected (stdin
+                 * EOF/error) but the child keeps running with no output
+                 * (e.g. `su -c 'sleep 30'`), kill it after ~10s of silence
+                 * so this connection never blocks the accept loop. */
+                if (stdin_closed) {
+                    /* Interactive: shell got VEOF and should exit; 10s is
+                     * plenty — kill a stuck shell. Non-interactive: a
+                     * client that closed stdin (pipe input) may still be
+                     * waiting for output, so give it 60s before killing —
+                     * this only guards against a dead client blocking the
+                     * accept loop forever (send_frame EPIPE already handles
+                     * the common case where the child produces output). */
+                    int limit = interactive ? 2 : 12;
+                    if (++idle_timeouts >= limit) {
+                        log_msg("client gone, killing idle child %d", child);
+                        kill(child, SIGTERM);
+                        break;
+                    }
+                }
+                continue;
             }
 
             /* Client → child stdin (raw, no framing) */
@@ -265,16 +339,44 @@ int main(int argc, char *argv[]) {
                 ssize_t n = read(cfd, buf, sizeof(buf));
                 if (n < 0) {
                     client_gone = 1;
-                    if (!stdin_closed) { close(stdin_pipe[1]); stdin_closed = 1; }
+                    if (!stdin_closed) {
+                        if (interactive) {
+                            /* pty shell won't see EOF — kill it */
+                            kill(child, SIGTERM);
+                        } else {
+                            close(stdin_pipe[1]);
+                        }
+                        stdin_closed = 1;
+                    }
                     fds[0].fd = -1; fds[0].events = 0;
                 } else if (n == 0) {
                     /* Client done writing (shutdown SHUT_WR) */
-                    if (!stdin_closed) { close(stdin_pipe[1]); stdin_closed = 1; }
+                    if (!stdin_closed) {
+                        if (interactive) {
+                            /* send VEOF to the pty (^D) so the shell exits
+                             * cleanly and the master yields EIO */
+                            char eof = 0x04;
+                            ssize_t w = write(master, &eof, 1);
+                            (void)w;
+                        } else {
+                            close(stdin_pipe[1]);
+                        }
+                        stdin_closed = 1;
+                    }
                     fds[0].fd = -1; fds[0].events = 0;
                 } else if (!stdin_closed) {
-                    ssize_t w = write(stdin_pipe[1], buf, n);
-                    if (w < 0 && errno == EPIPE) {
-                        close(stdin_pipe[1]); stdin_closed = 1;
+                    if (interactive) {
+                        ssize_t w = write(master, buf, n);
+                        if (w < 0 && errno == EIO) {
+                            /* pty master already gone — child exited */
+                            stdout_closed = 1;
+                            fds[1].fd = -1;
+                        }
+                    } else {
+                        ssize_t w = write(stdin_pipe[1], buf, n);
+                        if (w < 0 && errno == EPIPE) {
+                            close(stdin_pipe[1]); stdin_closed = 1;
+                        }
                     }
                 }
             }
@@ -282,33 +384,50 @@ int main(int argc, char *argv[]) {
             /* Child stdout → client (framed) */
             if (fds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
                 char buf[RELAY_BUF_SIZE];
-                ssize_t n = read(stdout_pipe[0], buf, sizeof(buf));
+                ssize_t n = interactive
+                    ? read(master, buf, sizeof(buf))
+                    : read(stdout_pipe[0], buf, sizeof(buf));
                 if (n <= 0) {
                     stdout_closed = 1;
                     fds[1].fd = -1; fds[1].events = 0;
                 } else if (!client_gone) {
-                    if (send_frame(cfd, buf, (uint32_t)n) < 0)
+                    if (send_frame(cfd, buf, (uint32_t)n) < 0) {
+                        /* Client is gone (write failed). The child may keep
+                         * running (e.g. sleep) — kill it so this connection
+                         * never blocks the accept loop. */
                         client_gone = 1;
+                        kill(child, SIGTERM);
+                        break;
+                    }
                 }
             }
 
-            /* Child stderr → client (framed) */
-            if (fds[2].revents & (POLLIN | POLLHUP | POLLERR)) {
+            /* Child stderr → client (framed, non-interactive only) */
+            if (!interactive && (fds[2].revents & (POLLIN | POLLHUP | POLLERR))) {
                 char buf[RELAY_BUF_SIZE];
                 ssize_t n = read(stderr_pipe[0], buf, sizeof(buf));
                 if (n <= 0) {
                     stderr_closed = 1;
                     fds[2].fd = -1; fds[2].events = 0;
                 } else if (!client_gone) {
-                    if (send_frame(cfd, buf, (uint32_t)n) < 0)
+                    if (send_frame(cfd, buf, (uint32_t)n) < 0) {
                         client_gone = 1;
+                        kill(child, SIGTERM);
+                        break;
+                    }
                 }
             }
         }
 
-        if (!stdin_closed) close(stdin_pipe[1]);
-        if (!stdout_closed) close(stdout_pipe[0]);
-        if (!stderr_closed) close(stderr_pipe[0]);
+        if (!stdin_closed) {
+            if (interactive) close(master);
+            else close(stdin_pipe[1]);
+        }
+        if (!stdout_closed) {
+            if (interactive) close(master);
+            else close(stdout_pipe[0]);
+        }
+        if (!stderr_closed && !interactive) close(stderr_pipe[0]);
 
         /* === Wait for child and get exit code === */
         int status;

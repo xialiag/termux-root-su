@@ -35,6 +35,7 @@
 #include <poll.h>
 #include <errno.h>
 #include <signal.h>
+#include <fcntl.h>
 
 #define RELAY_BUF_SIZE 4096
 /* Port file is written by service.sh. Inside proot containers the host path
@@ -109,10 +110,30 @@ int main(int argc, char *argv[]) {
         addr.sin_family = AF_INET;
         addr.sin_port = htons((uint16_t)p);
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        /* Non-blocking connect with a short timeout: a stale listener that
+         * swallows SYNs (kernel retries can hang a blocking connect for
+         * tens of seconds) must not stall the scan. */
+        int fl = fcntl(s, F_GETFL, 0);
+        fcntl(s, F_SETFL, fl | O_NONBLOCK);
+        int cr = connect(s, (struct sockaddr *)&addr, sizeof(addr));
+        if (cr != 0 && errno != EINPROGRESS) {
             close(s);
             continue;
         }
+        struct pollfd cfd2 = { .fd = s, .events = POLLOUT };
+        int cpret = poll(&cfd2, 1, 1000); /* 1s per candidate */
+        if (cpret <= 0) {
+            close(s);
+            continue;
+        }
+        int soerr = 0;
+        socklen_t slen = sizeof(soerr);
+        getsockopt(s, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+        if (soerr != 0) {
+            close(s);
+            continue;
+        }
+        fcntl(s, F_SETFL, fl); /* back to blocking for the relay */
         /* Send cmd_len + cmd */
         if (write(s, &cmd_len, 4) != 4 ||
             (cmd_len > 0 && write(s, cmd, cmd_len) != (ssize_t)cmd_len)) {
