@@ -1,6 +1,6 @@
 id=termux-root-su
 name=Termux Root SU
-version=v3.5
-versionCode=350
+version=v3.6
+versionCode=360
 author=AgentDev
 description=Gives proot containers real root via direct shell spawning (bypasses magiskd check-client)

@@ -1,12 +1,67 @@
 # termux-root-su 开发记忆
 
-## 当前状态 (v3.5, 2026-08-06)
-- **交互式 su 修复**: proxy 用 forkpty 给 child 真实 pty,提示符/回显/
-  Ctrl+C 全部正常(v3.4 的 pipe 方案导致"无输出、退不出")。
-- **connect 非阻塞超时**: 死监听者吞 SYN 时阻塞 connect 可挂 32s+,
-  现在每个端口最多 1s。
-- **proxy 防阻塞**: 客户端死后 kill child + idle 兜底,accept 循环永不卡。
-- v3.4 的 musl 静态编译、端口扫描、watchdog 均保留。
+## 当前状态 (v3.6, 2026-08-06)
+- **多连接修复**: proxy 每个连接 fork 独立 handler 进程,监听器永不
+  阻塞(v3.5 单连接串行,一个会话卡死 → 所有 su 排队超时)。
+- **会话释放修复**: relay 循环每次 poll 后 waitpid(child, WNOHANG),
+  shell 退出即释放连接(防 pty master 不 EIO 永久挂起)。
+- **bashrc 自愈**: /root/.bashrc 用 `su -c 'true'` 实测探测,proxy 没跑
+  时容器内自动拉起(nohup magisk-proxy <port> &,proot 共享宿主网络栈)。
+- v3.5 的 forkpty 交互、connect 非阻塞超时、idle 兜底、musl 静态均保留。
+
+## v3.6 单连接串行缺陷完整排查记忆 (2026-08-06)
+
+### 现象
+- 用户: "启动新会话提示 proxy 没跑" + "su 进入交互式但退不出来"。
+- 现场: proxy 日志有 `cmd=[] interactive=1`(一次交互连接)但之后
+  **没有 child exited 记录**;所有后续 su 报
+  `Cannot connect to daemon (127.0.0.1:48000-48019): Operation in
+  progress (os error 115)`(残留 errno,扫描全端口失败)。
+
+### 根因 (三层)
+1. **proxy 单连接串行**: `for(;;){accept; ...relay loop...;}` 一次只
+   处理一个连接。12:06:22 的交互会话(或其残留连接)卡住 relay 循环后,
+   后续连接 connect 成功(内核 backlog)但永远收不到 child_pid →
+   su 客户端每端口 1s 超时,全部失败。用 python connect + 发 cmd_len
+   后 2s 无响应可确认"被死连接占用"。
+2. **交互会话退出后连接不释放**: shell exit 后若 pty master 不产生
+   EIO(后台作业持有 slave 等),relay 循环永久 poll,连接永不释放。
+3. **bashrc 误报**: 检查 v2 时代遗留的 unix socket 文件
+   `magisk-proxy.sock`(v3.x TCP 架构下恒假)→ 每次新会话必报
+   "proxy 没跑",且提示指向已删除的 fix-proxy2.sh。
+
+### 修复
+- 连接处理抽成 handle_connection(cfd),accept 后 fork handler 进程;
+  父进程 SIGCHLD handler waitpid(-1, WNOHANG) 收割,handler 内恢复
+  SIG_DFL 自行 waitpid shell child。
+- relay 循环每次 poll 返回后 waitpid(child, WNOHANG): child 已退出 →
+  记 exit_code、break,循环后跳过 waitpid(child_waited 标志)。
+- bashrc: `timeout 3 su -c 'true'` 探测(proxy 活着时 hint 端口直达,
+  毫秒级);失败则 nohup 容器内拉起 proxy + 再探测;仍失败才提示
+  用户去宿主跑 watchdog。
+
+### 验证方法
+- 多连接: python 打开一个挂死交互连接(发 cmd_len=0 后不发任何输入),
+  并发 `su -c 'echo OK'` 应毫秒级成功(旧版会永久卡)。
+- 退出释放: python pty.fork() 驱动交互 su,`exit` 后 waitpid 应返回,
+  proxy.log 出现 "child X exited with code 0"。
+- bashrc 自愈: `pkill -x magisk-proxy` 后交互加载 bashrc
+  (`PS1='x' bash --noprofile -i -c 'exit'`)应打印自动启动并恢复 su。
+  ⚠️ `bash -c`(非交互)下 PS1 被清空,bashrc 开头 `[ -z "$PS1" ] && return`
+  会提前返回——测试必须用 `-i` 模拟交互加载。
+
+### 容器内诊断限制(重要)
+- `/proc/net/tcp` 容器内 Permission denied → 不能像 watchdog 那样查端口。
+- ps/pgrep 看不到宿主进程,容器内 pkill 杀不掉宿主侧 proxy。
+- 判定 proxy 状态: python connect 127.0.0.1:PORT(共享网络栈,可达);
+  connect OK + 发 cmd_len 无响应 = 被死连接占用。
+- 容器内能写宿主 /data/data/com.termux/files/usr/tmp 目录(可新建文件),
+  但 root 属主 644 文件(如 port 文件)不能覆盖写 → rm 后重建。
+
+## 待办
+- [ ] 用户刷入 v3.6 zip (termux-root-su-v3.6.zip, 重启后 service.sh
+      会用模块内旧版覆盖部署的 v3.6, 需重刷)
+- [ ] 旧宿主 proxy (pid 8177, 占 48000 死连接) 重启后自然消失, 无需处理
 
 ## v3.5 交互式 su 挂死完整排查记忆 (2026-08-06)
 

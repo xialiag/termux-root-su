@@ -1,5 +1,26 @@
 # CHANGELOG
 
+## v3.6 (2026-08-06)
+- **修复 proxy 单连接串行缺陷**: 旧 accept 循环一次只处理一个连接——一个
+  会话(如交互 shell 的 pty master 迟迟不产生 EIO,或客户端半断开)卡住
+  relay 循环后,所有后续 su 请求全部排队,connect 成功但永远收不到
+  child_pid,表现为 "Cannot connect to daemon: Operation in progress"。
+  现在每个连接 fork 独立 handler 进程,监听器永不阻塞;父进程 SIGCHLD
+  收割,handler 内恢复 SIG_DFL 自行 waitpid shell。
+  - 实测: 挂死交互会话占住一个 handler 时,并发 `su -c` 0.03s 完成。
+- **修复交互 shell 退出后连接不释放**: shell exit 后若 pty master 因后台
+  作业持有 slave 而不产生 EIO,旧 relay 循环永远 poll 等待,连接永久挂起。
+  relay 循环现在每次 poll 返回后 `waitpid(child, WNOHANG)` 检测 shell
+  是否已退出,已退出则立即结束会话、发送 exit_code,释放连接。
+- **bashrc 自愈(部署在容器 /root/.bashrc)**: 旧检查检测 unix socket
+  文件 `magisk-proxy.sock`(v2 时代遗留),v3.x TCP 架构下恒假 → 每次
+  新会话误报 "proxy 没跑" 且提示指向已删除的 fix-proxy2.sh。现在:
+  - 用 `su -c 'true'` 实测探测(proxy 活着时 hint 端口直达,毫秒级);
+  - proxy 未运行则自动在容器内拉起(`nohup magisk-proxy <port> &`),
+    利用 proot 与宿主共享网络栈,监听 127.0.0.1 立即可用;
+  - 拉起失败才提示用户去宿主 Termux 跑 watchdog。
+  - 实测: 杀 proxy 后交互加载 bashrc → 自动启动 + su 恢复可用。
+
 ## v3.5 (2026-08-06)
 - **修复交互式 `su` 无输出、Ctrl+C 无法退出**:proxy 对交互会话
   (cmd_len==0) 改用 `forkpty` 给 child 分配真实 pty。
