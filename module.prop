@@ -1,6 +1,6 @@
 id=termux-root-su
 name=Termux Root SU
-version=v3.9
-versionCode=390
+version=v3.10
+versionCode=3100
 author=AgentDev
-description=Gives proot containers real root via a host TCP proxy (bypasses magiskd check-client); v3.9 replaces broken pkill/killall with /proc-scan kill_pat
+description=Gives proot containers real root via a host TCP proxy (bypasses magiskd check-client); v3.10 fixes kill_pat hanging on magisk-domain /proc reads (watchdog self-death)

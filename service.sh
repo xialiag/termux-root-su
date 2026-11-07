@@ -38,11 +38,17 @@ log "=== service.sh v3.9 starting ==="
 # WARNING: never pass these substrings in an `su -c` one-liner — the cmd
 # lands in that shell's own cmdline and it kills itself mid-run. Always
 # invoke via a script file.
+# v3.10: shell redirection into /proc/<pid>/cmdline HANGS when the target is
+# in the magisk domain (this shell is too): the kernel blocks the open(). A
+# watchdog that calls kill_pat every 15s froze on the first magisk-domain
+# target and died, leaving the proxy with nobody to restart it. Read through
+# a killable timeout child instead, and skip anything that won't answer in 2s.
 kill_pat() {
     for _d in /proc/[0-9]*; do
         _pid="${_d#/proc/}"
         [ "$_pid" = "$$" ] && continue
-        _c=$(tr '\0' ' ' < "$_d/cmdline" 2>/dev/null)
+        _c=$(timeout 2 sh -c 'tr "\0" " " < "$1" 2>/dev/null' _ "$_d/cmdline" 2>/dev/null)
+        [ -z "$_c" ] && continue
         case "$_c" in
             *"$1"*) kill -9 "$_pid" 2>/dev/null ;;
         esac
@@ -226,11 +232,14 @@ wlog() {
 wlog "watchdog loop entered (pid $$)"
 # inline kill_pat: pkill cannot kill the magisk-domain zombies and would
 # also match this watchdog's own cmdline; scan /proc and skip $$.
+# v3.10: `< file` on a magisk-domain /proc/<pid>/cmdline blocks the open(); use
+# a killable timeout child or the watchdog itself hangs forever.
 kill_pat() {
     for _d in /proc/[0-9]*; do
         _pid="${_d#/proc/}"
         [ "$_pid" = "$$" ] && continue
-        _c=$(tr '\0' ' ' < "$_d/cmdline" 2>/dev/null)
+        _c=$(timeout 2 sh -c 'tr "\0" " " < "$1" 2>/dev/null' _ "$_d/cmdline" 2>/dev/null)
+        [ -z "$_c" ] && continue
         case "$_c" in *"$1"*) kill -9 "$_pid" 2>/dev/null ;; esac
     done
 }

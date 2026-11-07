@@ -1,5 +1,27 @@
 # CHANGELOG
 
+## v3.10 (2026-11-08)
+- **修复 watchdog 自杀**（根因：`kill_pat` 读 `/proc/<pid>/cmdline` 时内核
+  阻塞 open）。现象：代理+看门狗在某时刻后一起消失，`su -c 'id -u'` 报
+  `Cannot connect ... 48000-48019`，只能手动跑恢复脚本救回。
+  - 根因：watchdog 每 15s 调用一次 `kill_pat`，函数用 shell 重定向
+    `< /proc/<pid>/cmdline` 读命令名。当目标进程在 **magisk 域**（执行
+    shell 自己也在 magisk 域）时，内核会**阻塞 open()**，函数永久挂住 →
+    watchdog 卡死 → 代理死后无人在 15s 内重启 → 全灭。
+  - 修复：3 处 `kill_pat`（service.sh 主函数、service.sh 内嵌 watchdog
+    heredoc、tools/trsu-restart3.sh）改为
+    `_c=$(timeout 2 sh -c 'tr "\0" " " < "$1"' _ "$_d/cmdline")`，
+    读取在可 kill 的子进程里并带 2s 超时，卡住即跳过，永不阻塞。
+  - 同步 `tools/trsu-restart3.sh`（一次性恢复脚本）入仓，文档化恢复入口。
+- 排障附录（本次实测确认的非显性事实）：
+  - 容器内 `/proc/uptime` 是 **proot 伪造的静态值**，不能据此判断"设备刚
+    重启"。
+  - `su` 客户端报 `EINPROGRESS (os error 115)` 是误导表象；Python 直连
+    48000 才见真 `ECONNREFUSED(111)`＝端口确无人监听。
+  - 代理日志时间戳是 **UTC**（magisk 域 TZ），比容器 CST 慢 8 小时，非异常。
+  - 并发跑两个 `restart3.sh` 会互相覆盖脚本文件，导致
+    `Syntax error ")" unexpected`；必须单跑。
+
 ## v3.9 (2026-11-07)
 - **彻底移除 pkill/pgrep/killall**（本 MIUI ROM 上三者均不可靠，曾导致
   代理+看门狗全灭且无人拉起）:
