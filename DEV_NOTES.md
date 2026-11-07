@@ -246,3 +246,17 @@ proxy → 客户端:  uint32 exit_code
 ## 待办
 - [ ] 用户刷入 v3.4 验证 (宿主侧 su -c echo hi / 容器内 su -c id)
 - [ ] GitHub commit & push (v3.4)
+
+## v3.9 (2026-11-07): 彻底移除 pkill/pgrep/killall
+
+本机 ROM 上三者均不可靠, 曾导致代理+看门狗被误杀全灭且无人拉起:
+- toybox `pkill -x magisk-proxy`: rc=1, 什么都不杀 (僵尸代理长期占
+  48000-48003 就是这个原因留下的).
+- Termux `killall magisk-proxy`: 按截断 comm **前缀匹配**, 连带杀掉
+  comm="magisk-proxy-wa" 的 watchdog → 代理死了也没人重启.
+- 经 `su -c` 一行命令执行修复脚本时, 宽匹配 pkill 会命中调用方自己的
+  cmdline → 脚本被连坐 (rc=143), service.sh 半途夭折.
+
+正解: `kill_pat()` —— 扫 /proc/PID/cmdline + kill -9, 跳过 $$;
+代理模式带尾空格 `"magisk-proxy "` 以区分 watchdog 脚本. 恢复脚本
+(trsu-restart3.sh) 开头 setsid 自脱离再清场, 祖先进程免疫连坐.

@@ -125,3 +125,31 @@ proot 容器内:
 - v3.5: 交互 forkpty (无输出/退不出修复) + connect 超时 + proxy 防阻塞
 - v3.6: 多连接 handler (单连接串行修复) + child 退出检测 (连接释放)
         + bashrc 自愈 (容器内自动拉起 proxy)
+- v3.7: bashrc 改纯探测 (容器内假 root 占端口修复)
+- v3.8: 修"重启后 su 永远不可用"。双重根因:
+        (a) service.sh 的 CE 解锁等待只有 120s。本 ROM 的 late_start 远早于
+            用户首次解锁, 超时 exit 1 → su 部署和 proxy 启动整段静默跳过
+            (证据: su/端口文件时间戳停在 11-01, /debug_ramdisk/.magisk/device/
+            socket 的死 symlink 未被删 = service.sh 没跑到那行)。→ 提到 240s。
+        (b) boot-completed.sh 只要 watchdog **脚本文件**存在就 exit 0
+            ("watchdog 15s 内会拉起")。但 watchdog 是上次开机的进程, 重启后
+            进程没了、文件还在 → 开机自检恒过, 谁都不起 proxy → 无论重启
+            多少次都不行。→ 改成: 等 CE 解锁(最长 15min) → 无条件跑
+            service.sh → 用 `su -c 'id -u' == 0` 按身份验收, 绝不再按
+            文件是否存在推断进程状态。
+        另: 日志双写 /sdcard/Download/trsu-boot.log —— proot 绑定了 /sdcard,
+        容器里的 agent 免 root 就能看开机证据 (以前只能靠宿主人肉贴日志)。
+
+## 坑 9: Termux 里 /product/bin/su 报 CANNOT LINK EXECUTABLE (v3.8 文档化)
+- 症状: Termux 宿主 shell 里执行 `/product/bin/su -c '...'` →
+  `CANNOT LINK EXECUTABLE "/product/bin/su": library
+  "/data/data/com.termux/files/usr/lib/libtermux-exec-ld-preload.so"
+  needed or dlopened by "/product/bin/magisk" is not accessible for the
+  namespace "(default)"`
+- 根因: /product/bin/su 是 magisk 的符号链接, 客户端会重执行为 magisk 本体;
+  Termux 终端导出的 LD_PRELOAD 指向 Termux 私有 .so, Android linker 的
+  default namespace 拒绝加载 → 客户端在联系 magiskd 之前就死。
+- 复现: `LD_PRELOAD=...so /product/bin/magisk -v` 报同样错;
+  `env -u LD_PRELOAD /product/bin/magisk -v` 恢复正常(报 Cannot connect)。
+- 正解(以后所有文档/提示都用这条):
+  `env -u LD_PRELOAD /product/bin/su -c 'sh /sdcard/Download/fix-root2.sh'`

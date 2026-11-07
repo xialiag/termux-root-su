@@ -1,6 +1,6 @@
 id=termux-root-su
 name=Termux Root SU
-version=v3.6
-versionCode=360
+version=v3.9
+versionCode=390
 author=AgentDev
-description=Gives proot containers real root via direct shell spawning (bypasses magiskd check-client)
+description=Gives proot containers real root via a host TCP proxy (bypasses magiskd check-client); v3.9 replaces broken pkill/killall with /proc-scan kill_pat

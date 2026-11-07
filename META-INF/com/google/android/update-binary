@@ -1,28 +1,33 @@
 #!/sbin/sh
-# Magisk module installer
-# Minimal: just extract to module dir
+# Magisk module installer (self-contained; does not source util_functions)
 
-TMPDIR=/dev/tmp
-PERSISTDIR=/sbin/.magisk/mirror/persist
+UNZIP=$(command -v unzip || echo /system/bin/unzip)
 
-print_modname() {
-  ui_print "*******************************"
-  ui_print "  Termux Root SU v2.0"
-  ui_print "*******************************"
-}
+ui_print() { echo " - $*"; }
+abort() { ui_print "$*"; exit 1; }
 
-on_install() {
-  ui_print "- Extracting module files"
-  unzip -o "$ZIPFILE" -d "$MODPATH" >&2
-  
-  # Remove installer metadata
-  rm -rf "$MODPATH/META-INF"
-}
+ui_print "Termux Root SU v3.9"
+[ -z "$MODPATH" ] && MODPATH=/data/adb/modules/termux-root-su
+[ -z "$ZIPFILE" ] && abort "ZIPFILE not set"
 
-set_permissions() {
-  set_perm_recursive $MODPATH 0 0 0755 0644
-  set_perm $MODPATH/magisk-proxy 0 0 0755
-  set_perm $MODPATH/su-relay 0 0 0755
-  set_perm $MODPATH/service.sh 0 0 0755
-  [ -f "$MODPATH/boot-completed.sh" ] && set_perm $MODPATH/boot-completed.sh 0 0 0755
-}
+# Clean previous contents (keep the dir itself so Magisk state survives)
+mkdir -p "$MODPATH" || abort "cannot mkdir $MODPATH"
+find "$MODPATH" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+
+ui_print "Extracting to $MODPATH"
+"$UNZIP" -o -q "$ZIPFILE" -d "$MODPATH" 1>&2 || abort "extraction failed"
+rm -rf "$MODPATH/META-INF"
+
+ui_print "Setting permissions"
+chmod 0755 "$MODPATH" 2>/dev/null
+for f in module.prop bashrc-snippet.sh DEBUG_NOTES.md DEV_NOTES.md CHANGELOG.md; do
+    [ -f "$MODPATH/$f" ] && chmod 0644 "$MODPATH/$f"
+done
+for x in magisk-proxy su service.sh boot-completed.sh; do
+    [ -f "$MODPATH/$x" ] && chmod 0755 "$MODPATH/$x"
+done
+
+rm -f "$MODPATH/disable" "$MODPATH/remove"
+
+ui_print "Installed. Reboot, or run now:"
+ui_print "  sh $MODPATH/service.sh"

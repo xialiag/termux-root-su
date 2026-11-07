@@ -1,5 +1,38 @@
 # CHANGELOG
 
+## v3.9 (2026-11-07)
+- **彻底移除 pkill/pgrep/killall**（本 MIUI ROM 上三者均不可靠，曾导致
+  代理+看门狗全灭且无人拉起）:
+  - toybox `pkill -x magisk-proxy` 返回 rc=1 且什么都不杀（僵尸代理长期
+    占 48000-48003 即其遗留）；
+  - Termux `killall magisk-proxy` 按截断 comm **前缀匹配**，连带杀掉
+    comm="magisk-proxy-wa" 的 watchdog → 代理死后无人重启；
+  - 经 `su -c` 执行修复脚本时宽匹配 pkill 命中调用方自身 cmdline →
+    脚本被连坐(rc=143)，service.sh 半途夭折。
+  - 正解: `kill_pat()` 扫 /proc/PID/cmdline + kill -9（跳过 $$），代理
+    匹配串带尾空格 `"magisk-proxy "` 以区分 watchdog 脚本。
+- **端口分配改为启动后确认**: 起 proxy 后轮询日志最多 3s 等待
+  `tcp=127.0.0.1:<port>` 出现，成功即 break，失败才 kill_pat 换下一端口
+  （替代坏掉的 pkill 抢占式清端口）。
+
+## v3.8 (2026-11-05)
+- **修复"重启后 su 永远不可用"**。双重根因:
+  - (a) service.sh 的 CE 解锁等待只有 120s。本 ROM 的 late_start 远早于
+    用户首次解锁，超时 exit 1 → su 部署和 proxy 启动整段静默跳过。→ 240s。
+  - (b) boot-completed.sh 只要 watchdog **脚本文件**存在就 exit 0。但
+    watchdog 进程不跨重启，文件还在 → 开机自检恒过，谁都不起 proxy →
+    重启多少次都不行。→ 改为: 等 CE 解锁(最长 15min) → 无条件跑
+    service.sh → 用 `su -c 'id -u' == 0` 按身份验收，绝不按文件存在推断
+    进程状态。
+- **日志双写 /sdcard/Download/trsu-boot.log**: proot 绑定了 /sdcard，
+  容器内 agent 免 root 即可看开机证据。
+
+## v3.7 (2026-11-01)
+- **bashrc 改纯探测**（修复容器内假 root 占端口）: 容器内自起的 proxy 以
+  Termux uid(fake root) 运行并抢占 TCP 端口，宿主 watchdog 按身份验收会
+  杀掉它，期间容器内 su 拿到的却是假 root。snippet 现在只探测并提示去
+  宿主执行恢复命令，不再容器内自举。
+
 ## v3.6 (2026-08-06)
 - **修复 proxy 单连接串行缺陷**: 旧 accept 循环一次只处理一个连接——一个
   会话(如交互 shell 的 pty master 迟迟不产生 EIO,或客户端半断开)卡住
