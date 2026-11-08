@@ -1,6 +1,21 @@
 # CHANGELOG
 
 ## v3.10 (2026-11-08)
+- **修复大输出被静默截断（数据完整性，严重）**。`su -c 'cat bigfile'` 只拿到
+  16-28KB 就结束（500KB 文件 md5 不符）。两个独立根因：
+  - **proxy（src/magisk-proxy.c）**：relay 循环用 `waitpid(child, WNOHANG)`
+    一检测到子进程退出就 `break`，丢弃 pipe 里**尚未读出的** stdout/stderr。
+    快速命令（`cat`）瞬间写满 64K 管道后退出，handler 来不及 drain，尾部丢失。
+    修复：子进程退出只记录 exit_code 不 break；非交互模式继续 drain 两个 pipe
+    直到 EOF（read 返回 0）；交互模式先一次性非阻塞 drain pty master（设
+    `O_NONBLOCK`，遇 EAGAIN 停）再收尾，避免后台占 slave 时阻塞。补 `#include
+    <fcntl.h>`。
+  - **su（src/su.c）**：`write(STDOUT_FILENO, buf, n)` 的返回值被 `(void)`
+    丢弃。信号打断（Ctrl+C/SIGWINCH）或慢管道时 write 返回短写，尾部字节被
+    丢。新增 `xxwrite()`（EINTR 重试 + 循环写满），用于 stdout 与 stdin→sock
+    两处。同时修 stdin 分支把 `read()==EINTR` 误当 EOF 而提前 `shutdown` 的
+    老 bug，`xxread` 也加 EINTR 重试，end-marker 的 exit_code 读取失败时回落
+    为 1。
 - **修复 watchdog 自杀**（根因：`kill_pat` 读 `/proc/<pid>/cmdline` 时内核
   阻塞 open）。现象：代理+看门狗在某时刻后一起消失，`su -c 'id -u'` 报
   `Cannot connect ... 48000-48019`，只能手动跑恢复脚本救回。
@@ -8,11 +23,31 @@
     `< /proc/<pid>/cmdline` 读命令名。当目标进程在 **magisk 域**（执行
     shell 自己也在 magisk 域）时，内核会**阻塞 open()**，函数永久挂住 →
     watchdog 卡死 → 代理死后无人在 15s 内重启 → 全灭。
-  - 修复：3 处 `kill_pat`（service.sh 主函数、service.sh 内嵌 watchdog
-    heredoc、tools/trsu-restart3.sh）改为
-    `_c=$(timeout 2 sh -c 'tr "\0" " " < "$1"' _ "$_d/cmdline")`，
-    读取在可 kill 的子进程里并带 2s 超时，卡住即跳过，永不阻塞。
-  - 同步 `tools/trsu-restart3.sh`（一次性恢复脚本）入仓，文档化恢复入口。
+  - 修复：3 处 `kill_pat` 改为读取 `/proc/<pid>/comm`（15 字符任务名，永不
+    阻塞），彻底不再碰会阻塞的 `cmdline`。分两个函数：`kill_comm_eq`（精确
+    comm 匹配，用于 kill proxy「magisk-proxy」而不误杀 watchdog
+    「magisk-proxy-wa」，后者是前者的子串）与 `kill_pat`（子串匹配）。
+    用 shell 内建 `read` 读 comm，**零 fork**：一次全 /proc 扫描从原来的
+    ~14 秒（逐 pid `timeout 2 cat`）降到 ~85ms。这正是「恢复要等几分钟」
+    的根因——kill_pat 在 service.sh 里被调用多次、watchdog 每 15s 调一次。
+  - 实测：service.sh 全流程 3 秒、restart3（含部署+重启）8 秒、单实例
+    （1 listener + 1 watchdog）。
+- **脚本稳健性（审查发现）**：
+  - `service.sh` bashrc 片段删除加了护栏：只有 start+end 两个 marker 都在时
+    才做区间删除，否则 `sed` 会从 start 删到 EOF，摧毁用户 .bashrc 其余内容。
+  - `service.sh` 起 proxy 与 watchdog 重启 proxy 均改用 `setsid`（可用时）
+    脱离 service.sh 会话，避免随其退出收 SIGHUP。
+  - watchdog heredoc 的 `REAL_SOCK` 由硬编码 `/debug_ramdisk` 改为按
+    `magisk --path` / `/sbin` 探测，与 service.sh 一致。
+  - `tools/trsu-restart3.sh` 源目录改为 `$TRSU_SRC` > staging(trsu-v310/v38) >
+    `/data/adb/modules/termux-root-su`，不再硬编码已过期的 `trsu-v38`（新设备
+    不存在、旧设备会把 v3.9 写回模块）；验证段按 `id -u == 0` 给出 OK/WARN。
+  - `build.sh` 打包 `tools/trsu-restart3.sh` 与 `CHANGELOG.md`；`update-binary`
+    版本串升 v3.10 并 chmod tools 脚本。
+- **prebuilt 重新构建并对拍**：验证 `prebuilt/` 就是 `src/` 的 musl 静态构建
+  （旧 `su`/`magisk-proxy` 与 src 编译产物 md5 逐字节一致），本版按同一流程
+  重建两枚二进制。真机回归：`su -c` 大输出 500KB 完整、退出码透传、stdin
+  管道、stderr 分离、interactive pty 提示/回显/退出均正常。
 - 排障附录（本次实测确认的非显性事实）：
   - 容器内 `/proc/uptime` 是 **proot 伪造的静态值**，不能据此判断"设备刚
     重启"。

@@ -53,6 +53,7 @@
 #include <stdint.h>
 #include <signal.h>
 #include <time.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <poll.h>
 #include <pty.h>
@@ -266,14 +267,43 @@ static void handle_connection(int cfd) {
 
         /* The shell exited but its pty master may never yield EIO (e.g.
          * background jobs kept the slave open). Detect the exit directly
-         * so the connection is released instead of hanging forever. */
+         * so the connection is released instead of hanging forever.
+         *
+         * v3.10 BUG FIX: do NOT break on child exit — that discarded any
+         * stdout/stderr still buffered in the pipes. A fast command such as
+         * `su -c 'cat bigfile'` fills the 64K pipe, the child exits before
+         * the handler drains it, and the tail was silently lost (500KB file
+         * arrived as 16-28KB). Record the exit but keep looping until the
+         * pipes hit EOF (read returns 0). For a real pty (interactive) the
+         * master may stay open forever, so there we still break right after
+         * one drain pass — see the interactive branch below. */
         {
             int st;
             pid_t r = waitpid(child, &st, WNOHANG);
             if (r == child) {
                 child_waited = 1;
                 exit_code = WIFEXITED(st) ? WEXITSTATUS(st) : 1;
-                break;
+                if (interactive) {
+                    /* Drain whatever is buffered in the pty, then stop:
+                     * a background job may hold the slave open forever, so
+                     * a blocking read could hang here. Mark the master
+                     * non-blocking for the drain pass and stop at EAGAIN. */
+                    char dbuf[RELAY_BUF_SIZE];
+                    ssize_t dn;
+                    int fl = fcntl(master, F_GETFL, 0);
+                    if (fl >= 0) fcntl(master, F_SETFL, fl | O_NONBLOCK);
+                    while ((dn = read(master, dbuf, sizeof(dbuf))) > 0) {
+                        if (!client_gone && send_frame(cfd, dbuf, (uint32_t)dn) < 0) {
+                            client_gone = 1;
+                            break;
+                        }
+                    }
+                    stdout_closed = 1;
+                    fds[1].fd = -1; fds[1].events = 0;
+                    break;
+                }
+                /* non-interactive: fall through — keep draining the pipes
+                 * until EOF so no output is lost. */
             }
         }
 

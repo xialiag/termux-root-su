@@ -50,8 +50,24 @@ static int xxread(int fd, void *buf, size_t n) {
     size_t done = 0;
     while (done < n) {
         ssize_t r = read(fd, (char *)buf + done, n - done);
+        if (r < 0 && errno == EINTR) continue;   /* signal interrupted: retry */
         if (r <= 0) return -1;
         done += r;
+    }
+    return 0;
+}
+
+/* Write exactly n bytes, retrying on EINTR and short writes. A bare write()
+ * can return a partial count when a signal interrupts it (Ctrl+C, SIGWINCH)
+ * or the sink is a slow pipe/file; ignoring that return value silently
+ * truncates `su -c '...' > out` output. Returns 0 on success, -1 on error. */
+static int xxwrite(int fd, const void *buf, size_t n) {
+    size_t done = 0;
+    while (done < n) {
+        ssize_t w = write(fd, (const char *)buf + done, n - done);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) return -1;
+        done += (size_t)w;
     }
     return 0;
 }
@@ -195,6 +211,10 @@ int main(int argc, char *argv[]) {
         if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
             char buf[RELAY_BUF_SIZE];
             ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+            if (n < 0 && errno == EINTR) {
+                /* interrupted by a signal — NOT EOF; retry on next poll */
+                continue;
+            }
             if (n <= 0) {
                 /* stdin EOF — half-close so the proxy's child sees EOF
                  * on its stdin and can exit (e.g. `echo x | su -c cat`) */
@@ -202,8 +222,7 @@ int main(int argc, char *argv[]) {
                 fds[0].fd = -1;
                 fds[0].events = 0;
             } else {
-                ssize_t w = write(sock, buf, n);
-                if (w < 0) break;
+                if (xxwrite(sock, buf, (size_t)n) < 0) break;
             }
         }
 
@@ -214,8 +233,9 @@ int main(int argc, char *argv[]) {
             if (xxread(sock, &frame_len, 4) < 0) break;
 
             if (frame_len == 0) {
-                /* End-of-relay marker — read exit_code */
-                xxread(sock, &exit_code, 4);
+                /* End-of-relay marker — read exit_code (best-effort: if the
+                 * proxy closed early, keep the conservative default 1). */
+                if (xxread(sock, &exit_code, 4) < 0) exit_code = 1;
                 break;
             }
 
@@ -225,9 +245,11 @@ int main(int argc, char *argv[]) {
                 char buf[RELAY_BUF_SIZE];
                 uint32_t to_read = remaining < sizeof(buf) ? remaining : (uint32_t)sizeof(buf);
                 ssize_t n = read(sock, buf, to_read);
+                if (n < 0 && errno == EINTR) continue;
                 if (n <= 0) goto done;
-                ssize_t wr = write(STDOUT_FILENO, buf, n);
-                (void)wr;
+                /* Full write: a short write (signal-interrupted) must not
+                 * drop the tail of the child's output. */
+                if (xxwrite(STDOUT_FILENO, buf, (size_t)n) < 0) goto done;
                 remaining -= (uint32_t)n;
             }
         }

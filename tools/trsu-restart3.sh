@@ -12,7 +12,7 @@
 # 读取, 卡住即跳过。staging 目录名沿用 trsu-v38 以匹配现有部署。
 #
 # 本脚本规则:
-#  1) 全程不用 pkill/pgrep/killall, 只用 /proc/PID/cmdline 扫描 + kill -9
+#  1) 全程不用 pkill/pgrep/killall, 用 /proc/PID/comm 扫描 + kill -9(comm 不阻塞;cmdline 的 open 在 magisk 域会卡)
 #  2) 绝不匹配可能命中自身祖先的宽模式: 代理模式带尾空格 "magisk-proxy <port>"
 #  3) 开头 setsid 自脱离, 调用方 su -c 立即返回, 之后杀任何进程都不连坐
 #
@@ -34,50 +34,77 @@ fi
 
 T=/data/data/com.termux/files/usr/tmp
 M=/data/adb/modules/termux-root-su
-S=/sdcard/Download/trsu-v38   # v3.9 文件源(staging)
+# v3.10: pick the source of truth in this order:
+#   1. $TRSU_SRC (explicit override, e.g. an updated staging dir)
+#   2. a complete staging dir under /sdcard/Download (trsu-v310 / trsu-v38) —
+#      used when you have a freshly-built set to apply without re-flashing
+#   3. the INSTALLED MODULE dir (what Magisk last flashed)
+# Previously this hard-coded the stale /sdcard/Download/trsu-v38 (v3.9): on a
+# fresh device it is missing, and here it would have written v3.9 files back.
+S=""
+if [ -n "$TRSU_SRC" ] && [ -f "$TRSU_SRC/magisk-proxy" ] && [ -f "$TRSU_SRC/service.sh" ]; then
+    S="$TRSU_SRC"
+fi
+if [ -z "$S" ]; then
+    for cand in /sdcard/Download/trsu-v310 /sdcard/Download/trsu-v38; do
+        [ -f "$cand/magisk-proxy" ] && [ -f "$cand/service.sh" ] && { S="$cand"; break; }
+    done
+fi
+if [ -z "$S" ] && [ -f "$M/magisk-proxy" ] && [ -f "$M/service.sh" ]; then
+    S="$M"
+fi
+if [ -z "$S" ]; then
+    echo "FATAL: 找不到模块源目录(TRSU_SRC / staging / $M)；请先重刷模块 zip"
+    exit 1
+fi
+echo "源目录: $S"
 
-# v3.10: reading /proc/<pid>/cmdline via shell redirection (`< file`) HANGS
-# when the target is in the magisk domain (this shell also runs there); the
-# kernel blocks the open. Use `cat | tr` so the reader is a killable child
-# wrapped in timeout, and skip anything that won't answer in 2s.
+# v3.10: read /proc/<pid>/comm (15-char task name, never blocks), NOT cmdline
+# — cmdline's open() blocks for magisk-domain targets and made this scan take
+# minutes. Exact-comm variant separates the proxy (comm "magisk-proxy") from
+# the watchdog (comm "magisk-proxy-wa", which contains "magisk-proxy").
 kill_pat() {
     for _d in /proc/[0-9]*; do
         _pid="${_d#/proc/}"
         [ "$_pid" = "$$" ] && continue
-        _c=$(timeout 2 sh -c 'tr "\0" " " < "$1" 2>/dev/null' _ "$_d/cmdline" 2>/dev/null)
+        { read -r _c < "$_d/comm"; } 2>/dev/null || continue
         [ -z "$_c" ] && continue
         case "$_c" in
             *"$1"*) echo "kill $_pid [$_c]"; kill -9 "$_pid" 2>/dev/null ;;
         esac
     done
 }
+kill_comm_eq() {
+    for _d in /proc/[0-9]*; do
+        _pid="${_d#/proc/}"
+        [ "$_pid" = "$$" ] && continue
+        { read -r _c < "$_d/comm"; } 2>/dev/null || continue
+        [ "$_c" = "$1" ] && { echo "kill $_pid [$_c]"; kill -9 "$_pid" 2>/dev/null; }
+    done
+}
 
 echo "== 1) 清场: 旧代理/看门狗 =="
-kill_pat "magisk-proxy "
-kill_pat "magisk-proxy-watchdog.sh"
+kill_comm_eq "magisk-proxy"
+kill_pat "magisk-proxy-wa"
 kill_pat "su-relay"
 sleep 1
 
-echo "== 2) 重部署二进制 =="
+echo "== 2) 重部署二进制到 $T =="
 rm -f "$T/magisk-proxy" "$T/su"
 cp "$S/magisk-proxy" "$T/magisk-proxy" && chmod 755 "$T/magisk-proxy" && echo "proxy ok"
 cp "$S/su" "$T/su" && chmod 755 "$T/su" && echo "su ok"
 
-echo "== 3) 同步模块 (v3.9 文件覆盖已安装模块) =="
-if [ -d "$M" ]; then
-    cp "$S/service.sh" "$M/service.sh" && chmod 755 "$M/service.sh" && echo "module service.sh synced"
-    cp "$S/module.prop" "$M/module.prop" 2>/dev/null
-    cp "$S/bashrc-snippet.sh" "$M/bashrc-snippet.sh" 2>/dev/null
-else
-    echo "WARN: $M 不存在(模块未安装?)"
-fi
-
-echo "== 4) 跑 service.sh (staging v3.9) =="
+echo "== 3) 跑 service.sh ($S 权威源, 重新部署 su 到容器 + 起 proxy/watchdog) =="
 sh "$S/service.sh" 2>&1
 echo "service rc=$?"
-sleep 2
-echo "== 5) 验证 =="
-U=$(timeout 8 "$T/su" -c 'id -u' 2>&1)
+sleep 3
+echo "== 4) 验证 =="
+U=$(timeout 10 "$T/su" -c 'id -u' 2>&1)
 echo "su -c id -u => [$U]"
-echo "port file: $(cat $T/magisk-proxy.port 2>/dev/null)"
+echo "port file: $(cat "$T/magisk-proxy.port" 2>/dev/null)"
+if [ "$U" = "0" ]; then
+    echo "OK: root 代理已恢复"
+else
+    echo "WARN: su 未返回 0, 看 $T/magisk-proxy.log 与 /sdcard/Download/trsu-boot.log"
+fi
 echo "== done $(date) =="

@@ -6,7 +6,7 @@ UNZIP=$(command -v unzip || echo /system/bin/unzip)
 ui_print() { echo " - $*"; }
 abort() { ui_print "$*"; exit 1; }
 
-ui_print "Termux Root SU v3.9"
+ui_print "Termux Root SU v3.10"
 [ -z "$MODPATH" ] && MODPATH=/data/adb/modules/termux-root-su
 [ -z "$ZIPFILE" ] && abort "ZIPFILE not set"
 
@@ -26,6 +26,8 @@ done
 for x in magisk-proxy su service.sh boot-completed.sh; do
     [ -f "$MODPATH/$x" ] && chmod 0755 "$MODPATH/$x"
 done
+# v3.10: recovery tool shipped under tools/
+[ -f "$MODPATH/tools/trsu-restart3.sh" ] && chmod 0755 "$MODPATH/tools/trsu-restart3.sh"
 
 rm -f "$MODPATH/disable" "$MODPATH/remove"
 

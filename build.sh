@@ -71,6 +71,11 @@ cp boot-completed.sh "${TMPDIR}/"
 cp bashrc-snippet.sh "${TMPDIR}/"
 cp DEBUG_NOTES.md "${TMPDIR}/"
 cp DEV_NOTES.md "${TMPDIR}/"
+[ -f CHANGELOG.md ] && cp CHANGELOG.md "${TMPDIR}/"
+# v3.10: ship the one-shot recovery tool inside the module so a freshly
+# flashed device has it at /data/adb/modules/termux-root-su/tools/.
+mkdir -p "${TMPDIR}/tools"
+cp tools/trsu-restart3.sh "${TMPDIR}/tools/" 2>/dev/null || true
 cp META-INF/com/google/android/update-binary "${TMPDIR}/META-INF/com/google/android/"
 cp "${OUTDIR}/magisk-proxy" "${TMPDIR}/"
 cp "${OUTDIR}/su" "${TMPDIR}/"
