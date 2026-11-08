@@ -183,9 +183,20 @@ for rootfs in "$TERMUX_DATA/files/usr/var/lib/proot-distro/containers"/*/rootfs;
     log "deployed bashrc snippet ($SNIP_MARK) -> $rootfs/root/.bashrc"
 done
 
-# --- Start magisk-proxy (TCP loopback; proot hijacks unix sockets) ---
+# --- Start magisk-proxy ---
+# v3.10 SECURITY: primary transport is an abstract-namespace unix socket
+# (@termux-root-su) so the proxy can authenticate callers via SO_PEERCRED and
+# reject every app except Termux (uid) / root. proot does NOT hijack abstract
+# names, so this is reachable inside the container. TCP loopback remains only
+# as a fallback for ROMs where abstract sockets misbehave — it has no auth.
 PORT_FILE="$TERMUX_TMP/magisk-proxy.port"
 PROXY_LOG="$TERMUX_TMP/magisk-proxy.log"
+ABS_NAME="termux-root-su"
+
+# Termux uid = owner of the app data dir; the only non-root uid allowed in.
+TERMUX_UID=$(stat -c %u "$TERMUX_DATA" 2>/dev/null)
+[ -z "$TERMUX_UID" ] && TERMUX_UID=$(ls -nd "$TERMUX_DATA" 2>/dev/null | awk '{print $3}')
+log "Termux uid: ${TERMUX_UID:-unknown}"
 
 # Exact comm match: kills the proxy (comm "magisk-proxy") but NOT the
 # watchdog (comm "magisk-proxy-wa", which contains "magisk-proxy").
@@ -194,37 +205,60 @@ sleep 0.3
 rm -f "$PORT_FILE" "$PROXY_LOG"
 
 log "=== starting magisk-proxy ==="
-PORT=""
-# setsid (when available) detaches the proxy from service.sh's session so it
-# survives service.sh exiting / the parent shell's SIGHUP. Fall back to plain
-# background on ROMs whose toybox lacks setsid.
-start_proxy() {
+start_proxy() {   # $1 = argv[1]: "@<name>" (abstract) or numeric port
+    _raw="$TERMUX_TMP/magisk-proxy $1 $REAL_SOCK $PROXY_LOG ${TERMUX_UID:-0}"
     if command -v setsid >/dev/null 2>&1; then
-        setsid "$TERMUX_TMP/magisk-proxy" "$1" "$REAL_SOCK" "$PROXY_LOG" &
+        setsid $_raw &
     else
-        "$TERMUX_TMP/magisk-proxy" "$1" "$REAL_SOCK" "$PROXY_LOG" &
+        $_raw &
     fi
 }
-for i in $(seq 0 19); do
-    try_port=$((48000 + i))
-    start_proxy "$try_port"
-    j=0
-    while [ $j -lt 6 ]; do
-        j=$((j + 1)); sleep 0.5
-        grep -q "tcp=127.0.0.1:$try_port" "$PROXY_LOG" 2>/dev/null && break
-    done
-    if grep -q "tcp=127.0.0.1:$try_port" "$PROXY_LOG" 2>/dev/null; then
-        PORT="$try_port"
-        break
-    fi
-    kill_comm_eq "magisk-proxy"
-    sleep 0.3
+
+# --- 1) abstract unix socket (authenticated) ---
+start_proxy "@$ABS_NAME"
+j=0
+while [ $j -lt 8 ]; do
+    j=$((j + 1)); sleep 0.25
+    grep -q "abstract=@$ABS_NAME" "$PROXY_LOG" 2>/dev/null && break
 done
-if [ -z "$PORT" ]; then
-    log "FATAL: proxy could not bind any port (48000-48019)"; exit 1
+if grep -q "abstract=@$ABS_NAME" "$PROXY_LOG" 2>/dev/null; then
+    MODE="abstract"
+    PORT=""
+    log "proxy listening on abstract @$ABS_NAME (auth: uid 0 / ${TERMUX_UID:-?})"
+else
+    # --- 2) TCP fallback (no peer auth; only if abstract bind failed) ---
+    log "WARN: abstract socket failed, falling back to TCP loopback (NO AUTH)"
+    kill_comm_eq "magisk-proxy"; sleep 0.3; rm -f "$PROXY_LOG"
+    MODE="tcp"; PORT=""
+    for i in $(seq 0 19); do
+        try_port=$((48000 + i))
+        start_proxy "$try_port"
+        j=0
+        while [ $j -lt 6 ]; do
+            j=$((j + 1)); sleep 0.5
+            grep -q "tcp=127.0.0.1:$try_port" "$PROXY_LOG" 2>/dev/null && break
+        done
+        if grep -q "tcp=127.0.0.1:$try_port" "$PROXY_LOG" 2>/dev/null; then
+            PORT="$try_port"
+            break
+        fi
+        kill_comm_eq "magisk-proxy"
+        sleep 0.3
+    done
+    if [ -z "$PORT" ]; then
+        log "FATAL: proxy could not bind abstract or any TCP port (48000-48019)"; exit 1
+    fi
 fi
-echo "$PORT" > "$PORT_FILE"
-chmod 644 "$PORT_FILE"
+
+if [ "$MODE" = "tcp" ]; then
+    echo "$PORT" > "$PORT_FILE"
+    chmod 644 "$PORT_FILE"
+    log "proxy listening on 127.0.0.1:$PORT (port file: $PORT_FILE)"
+else
+    # No port to record; keep a marker so tools can tell abstract mode.
+    printf 'abstract:%s\n' "$ABS_NAME" > "$PORT_FILE"
+    chmod 644 "$PORT_FILE"
+fi
 # Also drop the port file into every container rootfs /tmp — that path IS
 # visible inside proot, so su inside the container hits the right port
 # directly instead of relying on the port scan fallback.
@@ -234,7 +268,6 @@ for rootfs in "$TERMUX_DATA/files/usr/var/lib/proot-distro/containers"/*/rootfs;
     chmod 644 "$rootfs/tmp/magisk-proxy.port" 2>/dev/null
     log "port file -> $rootfs/tmp/magisk-proxy.port"
 done
-log "proxy listening on 127.0.0.1:$PORT (port file: $PORT_FILE)"
 
 # --- Start watchdog: restart proxy if it dies or is not a root proxy ---
 WD="$TERMUX_TMP/magisk-proxy-watchdog.sh"
@@ -253,6 +286,9 @@ PROXY_LOG=/data/data/com.termux/files/usr/tmp/magisk-proxy.log
 SDLOG=/sdcard/Download/trsu-boot.log
 SU_BIN=/data/data/com.termux/files/usr/tmp/su
 PROXY_BIN=/data/data/com.termux/files/usr/tmp/magisk-proxy
+# v3.10: proxy re-spawn must pass the same allowed-uid (Termux) so restarted
+# instances keep SO_PEERCRED auth. __ALLOW_UID__ is substituted by service.sh.
+ALLOW_UID=__ALLOW_UID__
 # v3.10: detect MAGISKTMP like service.sh instead of hard-coding /debug_ramdisk;
 # some ROMs expose it only under /sbin, and a wrong path made restarts log a
 # confusing "socket not found" (proxy does not need it, but keep it truthful).
@@ -294,47 +330,53 @@ kill_comm_eq() {      # exact comm match (proxy "magisk-proxy" vs watchdog "magi
     done
 }
 while :; do
+    # v3.10: liveness = "is there a proxy process AND does su reach root".
+    # We no longer probe /proc/net/tcp because the primary transport is an
+    # abstract unix socket (no TCP table entry). A proxy in the magisk domain
+    # has unreadable /proc, so we count it via comm (never blocks).
     ALIVE=0
-    for p in 48000 48001 48002 48003 48004 48005 48006 48007 48008 48009 \
-             48010 48011 48012 48013 48014 48015 48016 48017 48018 48019; do
-        HEX=$(printf '%04X' "$p")
-        if grep -q ":$HEX " /proc/net/tcp 2>/dev/null; then
-            ALIVE=1
-            break
-        fi
+    for _d in /proc/[0-9]*; do
+        { read -r _c < "$_d/comm"; } 2>/dev/null || continue
+        [ "$_c" = "magisk-proxy" ] && { ALIVE=1; break; }
     done
     if [ "$ALIVE" = 1 ]; then
         UID_OUT=$(timeout 5 "$SU_BIN" -c 'id -u' 2>/dev/null)
-        # Empty output = transient (device doze froze the probe, proxy busy).
-        # Retry once; if still empty, LEAVE THE PROXY ALONE — only a
-        # confirmed non-zero uid proves a fake (container-spawned) proxy.
-        # v3.8 bug: empty was killed-on-sight, so nightly doze killed the
-        # real root proxy once an hour.
+        # Empty = transient (doze froze the probe). Retry once; if still
+        # empty, LEAVE THE PROXY ALONE — only a confirmed non-zero uid
+        # proves a fake (container-spawned) proxy.
         if [ -z "$UID_OUT" ]; then
             sleep 2
             UID_OUT=$(timeout 8 "$SU_BIN" -c 'id -u' 2>/dev/null)
         fi
         if [ -n "$UID_OUT" ] && [ "$UID_OUT" != "0" ]; then
-            wlog "port open but not root (id -u=$UID_OUT), killing fake"
+            wlog "proxy up but not root (id -u=$UID_OUT), killing fake"
             kill_comm_eq "magisk-proxy"
             sleep 1
             ALIVE=0
         fi
     fi
     if [ "$ALIVE" = 0 ]; then
-        PORT=$(cat "$PORT_FILE" 2>/dev/null)
-        [ -z "$PORT" ] && PORT=48000
-        wlog "proxy down, restarting on $PORT"
+        # Restart using the recorded transport (abstract by default).
+        MARK=$(cat "$PORT_FILE" 2>/dev/null)
+        case "$MARK" in
+            abstract:*) ARG="@${MARK#abstract:}" ;;
+            [0-9]*)     ARG="$MARK" ;;   # legacy TCP fallback
+            *)          ARG="@termux-root-su" ;;
+        esac
+        wlog "proxy down, restarting on $ARG"
         if command -v setsid >/dev/null 2>&1; then
-            setsid "$PROXY_BIN" "$PORT" "$REAL_SOCK" "$PROXY_LOG" &
+            setsid "$PROXY_BIN" "$ARG" "$REAL_SOCK" "$PROXY_LOG" "$ALLOW_UID" &
         else
-            "$PROXY_BIN" "$PORT" "$REAL_SOCK" "$PROXY_LOG" &
+            "$PROXY_BIN" "$ARG" "$REAL_SOCK" "$PROXY_LOG" "$ALLOW_UID" &
         fi
     fi
     sleep 15
 done
 WDEOF
 chmod 755 "$WD"
+# Substitute the allowed-uid placeholder now that we know it (heredoc is
+# single-quoted, so it was written literally).
+sed -i "s/__ALLOW_UID__/${TERMUX_UID:-0}/" "$WD"
 # v3.9: kill stale watchdogs first. Multiple watchdogs war over the proxy
 # (each probes via su; a transient empty probe makes one kill the shared
 # proxy, the others race to respawn it -> 4 proxies squatting 48000-48003

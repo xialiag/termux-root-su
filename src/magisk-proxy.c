@@ -1,3 +1,4 @@
+#define _GNU_SOURCE   /* struct ucred / SO_PEERCRED */
 /*
  * magisk-proxy v3.6 — relay-based proxy for proot environments.
  *
@@ -57,6 +58,7 @@
 #include <stdarg.h>
 #include <poll.h>
 #include <pty.h>
+#include <stddef.h>
 
 #define RELAY_BUF_SIZE 4096
 
@@ -492,6 +494,31 @@ int main(int argc, char *argv[]) {
         listen(srv, 10);
         log_msg("magisk-proxy v3.6 started (pid %d, uid %d) tcp=127.0.0.1:%ld",
                 getpid(), getuid(), port);
+    } else if (sock_path[0] == '@') {
+        /* v3.10 SECURITY: abstract-namespace unix socket (Linux: sun_path[0]
+         * == '\0'). proot only hijacks FILESYSTEM socket paths, not abstract
+         * names, so this is reachable from inside the container — enabling
+         * SO_PEERCRED authentication, which TCP loopback cannot provide.
+         * Only allow peer uid 0 (root) or our own uid (the Termux app). */
+        srv = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (srv < 0) { log_msg("socket() failed: %s", strerror(errno)); return 1; }
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        /* name after '@'; leading NUL marks abstract namespace */
+        size_t nlen = strlen(sock_path + 1);
+        if (nlen >= sizeof(addr.sun_path) - 1) {
+            log_msg("abstract name too long"); return 1;
+        }
+        memcpy(addr.sun_path + 1, sock_path + 1, nlen);
+        socklen_t alen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + nlen);
+        if (bind(srv, (struct sockaddr *)&addr, alen) < 0) {
+            log_msg("bind(@%s) failed: %s", sock_path + 1, strerror(errno));
+            return 1;
+        }
+        listen(srv, 10);
+        log_msg("magisk-proxy v3.10 started (pid %d, uid %d) abstract=@%s",
+                getpid(), getuid(), sock_path + 1);
     } else {
         srv = socket(AF_UNIX, SOCK_STREAM, 0);
         if (srv < 0) { log_msg("socket() failed: %s", strerror(errno)); return 1; }
@@ -503,10 +530,21 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         listen(srv, 10);
-        chmod(sock_path, 0666);
-        log_msg("magisk-proxy v3.6 started (pid %d, uid %d) sock=%s",
+        chmod(sock_path, 0600);   /* v3.10: was 0666 — no reason to world-write */
+        log_msg("magisk-proxy v3.10 started (pid %d, uid %d) sock=%s",
                 getpid(), getuid(), sock_path);
     }
+
+    /* v3.10: identity of the uid allowed to connect. The proxy runs in the
+     * magisk domain as uid 0, so it cannot infer the Termux uid from getuid();
+     * service.sh passes it as argv[4]. Absent -> fall back to getuid() (useful
+     * when the proxy is launched by the same user that should connect). */
+    uid_t allow_uid = getuid();
+    if (argc > 4) {
+        long au = atol(argv[4]);
+        if (au > 0) allow_uid = (uid_t)au;
+    }
+    const int abstract_mode = (sock_path[0] == '@');
 
     /* === Accept loop: each connection gets its own handler process ===
      * Serial processing would let one stuck session (interactive shell
@@ -518,6 +556,27 @@ int main(int argc, char *argv[]) {
             if (errno == EINTR) continue;
             log_msg("accept: %s", strerror(errno));
             continue;
+        }
+
+        /* v3.10 SECURITY: on the abstract socket, reject any peer that is not
+         * root or the Termux uid. Without this, any app on the device could
+         * connect and obtain a root shell (the TCP loopback listener had no
+         * way to tell callers apart). */
+        if (abstract_mode) {
+            struct ucred cred;
+            socklen_t clen = sizeof(cred);
+            if (getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, &cred, &clen) < 0) {
+                log_msg("SO_PEERCRED failed: %s", strerror(errno));
+                close(cfd);
+                continue;
+            }
+            if (cred.uid != 0 && cred.uid != allow_uid) {
+                log_msg("REJECT peer uid=%u pid=%d (allow %u/0)",
+                        (unsigned)cred.uid, (int)cred.pid, (unsigned)allow_uid);
+                close(cfd);
+                continue;
+            }
+            log_msg("accept peer uid=%u pid=%d", (unsigned)cred.uid, (int)cred.pid);
         }
 
         pid_t h = fork();

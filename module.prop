@@ -3,4 +3,4 @@ name=Termux Root SU
 version=v3.10
 versionCode=3100
 author=AgentDev
-description=Gives proot containers real root via a host TCP proxy (bypasses magiskd check-client); v3.10 fixes su output truncation (proxy drain + su short-write) and the kill_pat /proc-read hang/slowness (now reads comm, ~85ms)
+description=Real root for proot containers via an AUTHENTICATED abstract-unix-socket proxy (SO_PEERCRED: only Termux uid/root); fixes su output truncation and kill_pat hang/slowness

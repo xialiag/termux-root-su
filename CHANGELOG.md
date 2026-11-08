@@ -1,6 +1,20 @@
 # CHANGELOG
 
 ## v3.10 (2026-11-08)
+- **安全：消除本地提权面（高危）**。原来 proxy 监听 `127.0.0.1:48000`，TCP
+  无法识别对端，**设备上任意 app 都能连上并执行任意 root 命令**（日志/实测
+  均证实：容器内普通 Termux uid 连 48000 即得 `id -u=0`）。
+  - 传输层改为 **AF_UNIX 抽象命名空间 socket**（`@termux-root-su`）。proot
+    只劫持文件系统 socket 路径，不劫持抽象名，故容器内可达（已实测跨边界
+    连通）。抽象 socket 可用 `SO_PEERCRED` 拿到对端**真实 uid/pid**。
+  - proxy 校验 `cred.uid == 0 || cred.uid == Termux uid`，其余一律
+    `REJECT` 并断开；service.sh 把 Termux uid 作为 argv[4] 传入（proxy 在
+    magisk 域`getuid()==0`，不能自推）。watchdog 重启时也带同一 uid。
+  - su 客户端优先连抽象 socket，失败才回退 TCP 扫描（兼容老 ROM）。
+  - 实测：TCP 48000 不再 LISTEN，容器连 TCP 直接 ConnectionRefused；抽象
+    socket 上 Termux uid 放行、错误 uid 被拒（日志
+    `accept peer uid=10279` / `REJECT peer uid=...`）——**具备来源审计**。
+  - 附：文件系统 unix socket 分支的 chmod 从 0666 收紧为 0600。
 - **修复大输出被静默截断（数据完整性，严重）**。`su -c 'cat bigfile'` 只拿到
   16-28KB 就结束（500KB 文件 md5 不符）。两个独立根因：
   - **proxy（src/magisk-proxy.c）**：relay 循环用 `waitpid(child, WNOHANG)`

@@ -36,6 +36,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <stddef.h>
 
 #define RELAY_BUF_SIZE 4096
 /* Port file is written by service.sh. Inside proot containers the host path
@@ -110,8 +111,39 @@ int main(int argc, char *argv[]) {
     uint32_t cmd_len = cmd ? (uint32_t)strlen(cmd) : 0;
     uint32_t child_pid = 0;
     int sock = -1;
+
+    /* v3.10 SECURITY: prefer the abstract-namespace unix socket, which the
+     * proxy can authenticate via SO_PEERCRED (TCP loopback cannot). proot does
+     * not hijack abstract names, so this works inside the container. If it is
+     * not listening we fall back to the legacy TCP port scan below. */
+    {
+        int s = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (s >= 0) {
+            struct sockaddr_un ua;
+            memset(&ua, 0, sizeof(ua));
+            ua.sun_family = AF_UNIX;
+            const char *an = "termux-root-su";
+            size_t nlen = strlen(an);
+            memcpy(ua.sun_path + 1, an, nlen);
+            socklen_t alen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + nlen);
+            if (connect(s, (struct sockaddr *)&ua, alen) == 0) {
+                if (write(s, &cmd_len, 4) == 4 &&
+                    (cmd_len == 0 || write(s, cmd, cmd_len) == (ssize_t)cmd_len)) {
+                    struct pollfd pfd = { .fd = s, .events = POLLIN };
+                    if (poll(&pfd, 1, 2000) > 0 && xxread(s, &child_pid, 4) == 0) {
+                        sock = s;
+                    }
+                }
+                if (sock < 0) close(s);
+            } else {
+                close(s);
+            }
+        }
+    }
+
     int ports[PORT_SCAN_END - DEFAULT_PORT];
     int nports = 0;
+    if (sock < 0) {
     if (hint_port >= DEFAULT_PORT && hint_port < PORT_SCAN_END)
         ports[nports++] = hint_port;
     for (int p = DEFAULT_PORT; p < PORT_SCAN_END; p++)
@@ -165,6 +197,7 @@ int main(int argc, char *argv[]) {
         }
         sock = s;
     }
+    } /* end if (sock < 0) TCP fallback */
 
     if (sock < 0) {
         fprintf(stderr,
