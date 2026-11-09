@@ -78,7 +78,11 @@ if [ -z "$MAGISKTMP" ]; then
     done
 fi
 if [ -z "$MAGISKTMP" ]; then
-    log "FATAL: cannot find MAGISKTMP"; exit 1
+    # KernelSU (no Magisk tmpfs): the proxy forks shells directly and never
+    # talks to magiskd, so a placeholder keeps the best-effort socket probe
+    # harmless instead of aborting the whole service.
+    MAGISKTMP="/data/adb/ksu"
+    log "no Magisk tmpfs; KernelSU fallback MAGISKTMP=$MAGISKTMP"
 fi
 log "MAGISKTMP=$MAGISKTMP"
 
@@ -88,10 +92,14 @@ log "MAGISKTMP=$MAGISKTMP"
 # left a dead symlink here (socket -> magisk-proxy.sock, target removed);
 # clean it so magisk clients can reconnect after a magiskd restart.
 REAL_SOCK="$MAGISKTMP/.magisk/device/socket"
-for i in $(seq 1 15); do
-    [ -S "$REAL_SOCK" ] && break
-    sleep 1
-done
+if [ -d "$MAGISKTMP/.magisk" ]; then
+    for i in $(seq 1 15); do
+        [ -S "$REAL_SOCK" ] && break
+        sleep 1
+    done
+else
+    log "no Magisk tmpfs; skipping magiskd socket wait"
+fi
 if [ -L "$REAL_SOCK" ] && [ ! -e "$REAL_SOCK" ]; then
     log "removing dead symlink at $REAL_SOCK (su-relay legacy)"
     rm -f "$REAL_SOCK"
