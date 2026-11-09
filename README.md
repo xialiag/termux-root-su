@@ -2,6 +2,7 @@
 
 **在 Termux proot 容器内获取 Magisk 真 root 权限。**
 
+注意: 此模块用于在proot环境中使用真实su，需要设备已root，并不能帮你获取root
 一个 Magisk 模块，通过 root 代理架构，让 proot 容器内的 `su` 命令绕过 magiskd 的 `check-client` 门禁，直接以 uid=0 执行 shell。
 
 ## 效果
