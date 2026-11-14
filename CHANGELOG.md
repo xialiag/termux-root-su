@@ -1,8 +1,8 @@
 # CHANGELOG
 
-## v3.12 (2026-11-14)
+## v3.12.1 (2026-11-14)
 
-### 修复：watchdog 版本错配死循环（su 静默死亡 3 天）
+#### 现象与根因：watchdog 版本错配死循环（su 静默死亡 3 天）
 现象：容器内 `su -c id` 报 `Cannot connect to daemon (127.0.0.1:48000-48019)`，
 `trsu-boot.log` 里 1515 条 `port open but not root (id -u=), killing fake` →
 `proxy down, restarting on 48000`，su 从 2026-11-11 起全程不可用而无人察觉。
@@ -18,7 +18,23 @@
 3. **探测空 = 无信息**。原逻辑无法区分「代理忙/系统冻结」与「代理根本是
    另一个传输层版本」，所以 3 天里没有任何一条日志说明真正原因。
 
-修复（`service.sh` 内嵌 watchdog 重写为 v3.12）：
+#### 修复（`service.sh` 内嵌 watchdog 重写为 v3.12）
+- **【严重回归修复】watchdog 根本没被启动**。改 heredoc 时误删了
+  `chmod 755 "$WD"` 之后的整段启动代码（`kill_pat` 旧 watchdog +
+  `setsid nohup "$WD"`），只剩一句 `log "watchdog started (pid $!)"`。
+  后果：日志声称「已启动」而实际没有任何 watchdog，`$!` 报的还是上游
+  残留 pid（实测把 **proxy 的 pid 28269** 当成 watchdog 回报），自愈
+  能力归零——正是本次事故的同一失败模式再次出现。
+  修复要点：① 恢复启动段；② `$!` 在 `setsid nohup ... &` 后指向 wrapper
+  而非脱离后的真 watchdog，改为 2 秒后回读 `/proc/*/comm` 找
+  `magisk-proxy-wa`（15 字符截断），拿到真实 pid 才记 "watchdog started"；
+  ③ 找不到就写 `FATAL: watchdog did NOT start` 并给恢复命令，不再无条件
+  报成功；④ 顺带校验 heredoc 占位符替换是否成功（未替换会让 proxy 以
+  `allow_uid=0` 拒绝 Termux uid，表现为 `Connection reset`）。
+  **真机验证**（2026-11-14 19:31）：`watchdog started (pid 20837)` 为真实
+  watchdog；`kill -9` 掉 proxy 后 18 秒内日志出现
+  `proxy process alive but not listening` → `starting proxy with
+  @termux-root-su`，`su -c 'id -u'` 恢复 `0`。
 - **`magisk-proxy --probe <transport>`**：新增探针模式，直接 `bind()` 判定
   目标传输是否已被占用（`EADDRINUSE` = 在监听），**不读 `/proc/net`**——
   Android 常对非 root 拒绝 `/proc/net/unix`，表格法会静默误报「无人监听」

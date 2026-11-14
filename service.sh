@@ -558,6 +558,43 @@ WDOUTER
 chmod 755 "$WD"
 # Substitute the two placeholders (the heredoc is single-quoted on purpose).
 sed -i "s|__ALLOW_UID__|${TERMUX_UID:-0}|; s|__MODDIR__|$MODDIR|" "$WD"
-log "watchdog started (pid $!)"
+
+# v3.12: verify the substitution actually landed; an un-substituted heredoc
+# would leave ALLOW_UID=__ALLOW_UID__ (atol fails -> allow_uid=0 -> the proxy
+# rejects the Termux uid and su breaks with "Connection reset").
+if grep -q "__ALLOW_UID__\|__MODDIR__" "$WD" 2>/dev/null; then
+    log "FATAL: watchdog placeholder substitution failed (sed) — refusing to start it"
+else
+    # v3.9: kill stale watchdogs first. Multiple watchdogs war over the proxy
+    # (each probes via su; a transient empty probe makes one kill the shared
+    # proxy, the others race to respawn it -> 4 proxies squatting 48000-48003
+    # and flapping su). Newest service.sh run must own the watchdog role alone.
+    kill_pat "magisk-proxy-wa"
+    sleep 1
+    # toybox on some ROMs lacks setsid; fall back to plain nohup.
+    # NOTE: $! is the setsid/nohup wrapper, NOT the detached watchdog — the
+    # real pid must be read back from /proc (see below), otherwise the log
+    # claims "watchdog started (pid N)" where N is an unrelated process.
+    if command -v setsid >/dev/null 2>&1; then
+        setsid nohup "$WD" >/dev/null 2>&1 &
+    else
+        nohup "$WD" >/dev/null 2>&1 &
+    fi
+    # v3.12: report the pid that actually appeared (comm is truncated to
+    # "magisk-proxy-wa" by the 15-char task-name limit), and scream if it
+    # never did — "watchdog started" was previously logged unconditionally,
+    # which masked exactly this failure on 2026-11-14.
+    sleep 2
+    WD_PID=""
+    for _d in /proc/[0-9]*; do
+        { read -r _c < "$_d/comm"; } 2>/dev/null || continue
+        [ "$_c" = "magisk-proxy-wa" ] && WD_PID="${_d#/proc/}" && break
+    done
+    if [ -n "$WD_PID" ]; then
+        log "watchdog started (pid $WD_PID)"
+    else
+        log "FATAL: watchdog did NOT start; su will not self-heal. Run tools/trsu-restart3.sh as host root"
+    fi
+fi
 
 log "=== service.sh done ==="

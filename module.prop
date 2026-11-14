@@ -1,6 +1,6 @@
 id=termux-root-su
 name=Termux Root SU
-version=v3.12
-versionCode=3120
+version=v3.12.1
+versionCode=3121
 author=AgentDev
-description=Real root for proot containers via an AUTHENTICATED abstract-unix-socket proxy (SO_PEERCRED); v3.12 watchdog self-heals transport/binary version mismatch (2026-11-14 incident: 1515-iteration kill/restart loop left su dead for 3 days)
+description=Real root for proot containers via an AUTHENTICATED abstract-unix-socket proxy (SO_PEERCRED); v3.12.1 restores the watchdog launch block that v3.12 accidentally deleted, and reports the real watchdog pid (was logging the proxy's)
