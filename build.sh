@@ -76,6 +76,7 @@ cp DEV_NOTES.md "${TMPDIR}/"
 # flashed device has it at /data/adb/modules/termux-root-su/tools/.
 mkdir -p "${TMPDIR}/tools"
 cp tools/trsu-restart3.sh "${TMPDIR}/tools/" 2>/dev/null || true
+cp tools/trsu-watchdog-selfcheck.md "${TMPDIR}/tools/" 2>/dev/null || true
 cp META-INF/com/google/android/update-binary "${TMPDIR}/META-INF/com/google/android/"
 cp "${OUTDIR}/magisk-proxy" "${TMPDIR}/"
 cp "${OUTDIR}/su" "${TMPDIR}/"

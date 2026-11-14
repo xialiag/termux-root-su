@@ -11,6 +11,9 @@
 # (2) CE-unlock wait raised 120s -> 240s (this ROM reaches late_start long
 # before the user unlocks; 120s expired silently on 2026-11-05 boot and the
 # su deploy + proxy start never ran); (3) FATAL paths also log to sdcard.
+# v3.12: watchdog has a deployment self-check (binary vs transport marker) and a
+# probe-streak circuit breaker; see the watchdog heredoc for the 2026-11-14
+# incident where a version mismatch caused a 1515-iteration kill/restart loop.
 # v3.9: pkill/pgrep/killall are broken on this ROM (missed kills on
 # magisk-domain procs; Termux killall prefix-matches the watchdog comm
 # "magisk-proxy-wa" and dragged watchdog+proxy down together on 2026-11-06).
@@ -20,6 +23,7 @@
 # Portable: auto-discovers all paths. Runs as root by Magisk at boot.
 
 MODDIR="${0%/*}"
+case "$MODDIR" in /*) ;; *) MODDIR="$(cd "$MODDIR" 2>/dev/null && pwd || echo "$MODDIR")" ;; esac
 LOG="/data/local/tmp/termux-root-su.log"
 SDLOG="/sdcard/Download/trsu-boot.log"
 
@@ -29,7 +33,7 @@ log() {
     # silently fail before that, which is expected.
     echo "$(date '+%Y-%m-%d %H:%M:%S') [service] $*" >> "$SDLOG" 2>/dev/null
 }
-log "=== service.sh v3.10 starting ==="
+log "=== service.sh v3.12 starting ==="
 # kill_pat <comm-substr>: kill -9 processes whose /proc/<pid>/comm contains
 # <comm-substr>. pkill/killall are NOT usable on this ROM (toybox pkill -x
 # kills nothing; Termux killall prefix-matches the watchdog comm and dragged
@@ -78,11 +82,7 @@ if [ -z "$MAGISKTMP" ]; then
     done
 fi
 if [ -z "$MAGISKTMP" ]; then
-    # KernelSU (no Magisk tmpfs): the proxy forks shells directly and never
-    # talks to magiskd, so a placeholder keeps the best-effort socket probe
-    # harmless instead of aborting the whole service.
-    MAGISKTMP="/data/adb/ksu"
-    log "no Magisk tmpfs; KernelSU fallback MAGISKTMP=$MAGISKTMP"
+    log "FATAL: cannot find MAGISKTMP"; exit 1
 fi
 log "MAGISKTMP=$MAGISKTMP"
 
@@ -92,14 +92,10 @@ log "MAGISKTMP=$MAGISKTMP"
 # left a dead symlink here (socket -> magisk-proxy.sock, target removed);
 # clean it so magisk clients can reconnect after a magiskd restart.
 REAL_SOCK="$MAGISKTMP/.magisk/device/socket"
-if [ -d "$MAGISKTMP/.magisk" ]; then
-    for i in $(seq 1 15); do
-        [ -S "$REAL_SOCK" ] && break
-        sleep 1
-    done
-else
-    log "no Magisk tmpfs; skipping magiskd socket wait"
-fi
+for i in $(seq 1 15); do
+    [ -S "$REAL_SOCK" ] && break
+    sleep 1
+done
 if [ -L "$REAL_SOCK" ] && [ ! -e "$REAL_SOCK" ]; then
     log "removing dead symlink at $REAL_SOCK (su-relay legacy)"
     rm -f "$REAL_SOCK"
@@ -213,12 +209,15 @@ sleep 0.3
 rm -f "$PORT_FILE" "$PROXY_LOG"
 
 log "=== starting magisk-proxy ==="
+# v3.12: the proxy is spawned with the REAL magiskd socket when it exists.
+# Handing it "" (as an earlier watchdog did) made a TCP-mode proxy argv[3]
+# empty, which is harmless, but a shell word-split of "$REAL_SOCK" with
+# spaces would silently shift argv; pass it as a proper argument instead.
 start_proxy() {   # $1 = argv[1]: "@<name>" (abstract) or numeric port
-    _raw="$TERMUX_TMP/magisk-proxy $1 $REAL_SOCK $PROXY_LOG ${TERMUX_UID:-0}"
     if command -v setsid >/dev/null 2>&1; then
-        setsid $_raw &
+        setsid "$TERMUX_TMP/magisk-proxy" "$1" "$REAL_SOCK" "$PROXY_LOG" "${TERMUX_UID:-0}" &
     else
-        $_raw &
+        "$TERMUX_TMP/magisk-proxy" "$1" "$REAL_SOCK" "$PROXY_LOG" "${TERMUX_UID:-0}" &
     fi
 }
 
@@ -277,50 +276,69 @@ for rootfs in "$TERMUX_DATA/files/usr/var/lib/proot-distro/containers"/*/rootfs;
     log "port file -> $rootfs/tmp/magisk-proxy.port"
 done
 
-# --- Start watchdog: restart proxy if it dies or is not a root proxy ---
+# --- Start watchdog: restart proxy if it dies, is not a root proxy, or the
+# deployed binaries disagree with the transport recorded in PORT_FILE ---
+#
+# v3.12 FIX (2026-11-14 incident): a *version mismatch* between the deployed
+# binaries and the recorded transport turned the watchdog into a kill/restart
+# loop that ran 1515 times unnoticed. Root cause chain:
+#   * service.sh v3.10 wrote "abstract:termux-root-su" into PORT_FILE and ran
+#     the (old, v3.9) TCP-only binaries, which could never bind that name;
+#   * the watchdog's liveness test was "is there a process called
+#     magisk-proxy" + "does the probe `su -c 'id -u'` return 0";
+#   * the probe was empty on every iteration (old TCP client vs abstract
+#     marker), and an empty probe is *by design* treated as transient and
+#     left alone — so nothing was killed, nothing was started, and su stayed
+#     dead for 3 days while the log filled with restarts.
+# Repaired invariants in this version:
+#   1. LIVENESS without a probe: an abstract socket shows up in /proc/net/unix
+#      and a TCP listener in /proc/net/tcp, so the watchdog can tell "nobody
+#      is listening" from "listener is stale" without asking su.
+#   2. TRANSPORT SELF-CHECK: compare the marker in PORT_FILE with what the
+#      deployed proxy actually supports (string present in its .text). On a
+#      mismatch, redeploy from the module directory and restart the proxy
+#      instead of restarting the same broken pair forever.
+#   3. PROBE STREAK CIRCUIT BREAKER: after N consecutive failed identity
+#      probes the watchdog stops trying to "fix" the proxy blindly; it
+#      re-checks the deployment (step 2), logs a FATAL line and, if the
+#      module files are intact, replays service.sh once per boot.
+#   4. Every decision is logged to /sdcard (readable inside proot), so a
+#      silently wrong deployment can never again be invisible.
 WD="$TERMUX_TMP/magisk-proxy-watchdog.sh"
-cat > "$WD" <<'WDEOF'
+cat > "$WD" <<'WDOUTER'
 #!/system/bin/sh
-# termux-root-su v3.8 watchdog — keep a ROOT magisk-proxy listening.
-# Liveness via /proc/net/tcp (a proxy in the magisk SELinux domain has an
-# unreadable /proc/<pid>, so pgrep/ps cannot see it). Identity via
-# `su -c 'id -u'` == 0: a proxy spawned inside the proot container listens
-# fine but forks children as the Termux uid (fake root), so an open port
-# alone is NOT proof of a working root proxy.
-# v3.8: dual-writes to /sdcard/Download/trsu-boot.log so the container can
-# read supervisor evidence without root.
+# termux-root-su v3.12 watchdog — keep a ROOT magisk-proxy listening.
 PORT_FILE=/data/data/com.termux/files/usr/tmp/magisk-proxy.port
 PROXY_LOG=/data/data/com.termux/files/usr/tmp/magisk-proxy.log
 SDLOG=/sdcard/Download/trsu-boot.log
 SU_BIN=/data/data/com.termux/files/usr/tmp/su
 PROXY_BIN=/data/data/com.termux/files/usr/tmp/magisk-proxy
-# v3.10: proxy re-spawn must pass the same allowed-uid (Termux) so restarted
+MODDIR=__MODDIR__
+# v3.12: proxy re-spawn must pass the same allowed-uid (Termux) so restarted
 # instances keep SO_PEERCRED auth. __ALLOW_UID__ is substituted by service.sh.
 ALLOW_UID=__ALLOW_UID__
-# v3.10: detect MAGISKTMP like service.sh instead of hard-coding /debug_ramdisk;
-# some ROMs expose it only under /sbin, and a wrong path made restarts log a
-# confusing "socket not found" (proxy does not need it, but keep it truthful).
-REAL_SOCK=""
-if command -v magisk >/dev/null 2>&1; then
-    MT="$(magisk --path 2>/dev/null)"
-    [ -n "$MT" ] && REAL_SOCK="$MT/.magisk/device/socket"
-fi
-if [ -z "$REAL_SOCK" ]; then
-    for _d in /debug_ramdisk /sbin; do
-        [ -d "$_d/.magisk" ] && REAL_SOCK="$_d/.magisk/device/socket" && break
-    done
-fi
-[ -z "$REAL_SOCK" ] && REAL_SOCK=/debug_ramdisk/.magisk/device/socket
+PROBE_FAILS_MAX=4        # ~1 min of consecutive failed probes before declaring the deployment broken
+sleep_between=15
+probe_streak=0
+service_replayed=0
+last_marker_state=""
+
 wlog() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') [watchdog] $*" >> "$PROXY_LOG" 2>/dev/null
     echo "$(date '+%Y-%m-%d %H:%M:%S') [watchdog] $*" >> "$SDLOG" 2>/dev/null
 }
-wlog "watchdog loop entered (pid $$)"
-# inline kill helpers: pkill is unreliable on this ROM; read /proc/<pid>/comm
-# (a 15-char task name that never blocks) and skip ourselves.
-# v3.10: NEVER read /proc/<pid>/cmdline — its open() blocks for magisk-domain
-# targets and froze this very watchdog every 15s, leaving su dead. comm is safe.
-kill_pat() {          # substring match on comm
+
+# kill by exact /proc/<pid>/comm (never cmdline: its open() blocks in the
+# magisk domain and used to freeze this watchdog).
+kill_comm_eq() {
+    for _d in /proc/[0-9]*; do
+        _pid="${_d#/proc/}"
+        [ "$_pid" = "$$" ] && continue
+        { read -r _c < "$_d/comm"; } 2>/dev/null || continue
+        [ "$_c" = "$1" ] && kill -9 "$_pid" 2>/dev/null
+    done
+}
+kill_pat() {   # substring match on comm (truncated to 15 chars by the kernel)
     for _d in /proc/[0-9]*; do
         _pid="${_d#/proc/}"
         [ "$_pid" = "$$" ] && continue
@@ -329,74 +347,217 @@ kill_pat() {          # substring match on comm
         case "$_c" in *"$1"*) kill -9 "$_pid" 2>/dev/null ;; esac
     done
 }
-kill_comm_eq() {      # exact comm match (proxy "magisk-proxy" vs watchdog "magisk-proxy-wa")
+
+proxy_running() {
     for _d in /proc/[0-9]*; do
-        _pid="${_d#/proc/}"
-        [ "$_pid" = "$$" ] && continue
         { read -r _c < "$_d/comm"; } 2>/dev/null || continue
-        [ "$_c" = "$1" ] && kill -9 "$_pid" 2>/dev/null
+        [ "$_c" = "magisk-proxy" ] && return 0
     done
+    return 1
 }
-while :; do
-    # v3.10: liveness = "is there a proxy process AND does su reach root".
-    # We no longer probe /proc/net/tcp because the primary transport is an
-    # abstract unix socket (no TCP table entry). A proxy in the magisk domain
-    # has unreadable /proc, so we count it via comm (never blocks).
-    ALIVE=0
-    for _d in /proc/[0-9]*; do
-        { read -r _c < "$_d/comm"; } 2>/dev/null || continue
-        [ "$_c" = "magisk-proxy" ] && { ALIVE=1; break; }
+
+# The transport the proxy is *supposed* to serve, derived from the marker
+# service.sh wrote. Empty marker => unknown (pre-v3.8 deployments).
+transport_of_marker() {
+    _m=$(cat "$PORT_FILE" 2>/dev/null)
+    case "$_m" in
+        abstract:*) echo "abstract:${_m#abstract:}" ;;
+        [0-9]*)     echo "tcp:$_m" ;;
+        *)          echo "" ;;
+    esac
+}
+
+# Is anything listening for our transport?
+#   abstract: `--probe` bind()s the name; EADDRINUSE proves a listener exists.
+#             This is the ONLY reliable oracle — Android denies /proc/net/unix
+#             to non-root, and a table grep there reports "nobody listening"
+#             while a proxy is already serving (duplicate spawns then all die
+#             on EADDRINUSE).
+#   tcp:      process-name check only: a :PORT row in /proc/net/tcp cannot be
+#             attributed to our proxy, and killing an unknown holder would be
+#             worse than a harmless duplicate attempt.
+listening() {
+    case "$1" in
+        abstract:*)
+            # A bind attempt is the only reliable oracle: Android routinely
+            # denies /proc/net/unix to non-root, so table greps silently
+            # report "nobody listening" and spawn duplicate proxies that then
+            # die on EADDRINUSE. --probe exits 0 when the name is taken.
+            "$PROXY_BIN" --probe "$1" >/dev/null 2>&1
+            ;;
+        tcp:*) proxy_running ;;
+        *)     return 1 ;;
+    esac
+}
+
+# Does the deployed proxy binary understand the transport we need? A v3.9
+# TCP-only build has no abstract-socket code, so its .text lacks the marker
+# string the server logs on bind. Absence => mismatch.
+binary_supports() {
+    [ -x "$PROXY_BIN" ] || return 1
+    case "$1" in
+        abstract:*) grep -qa "abstract=@" "$PROXY_BIN" 2>/dev/null ;;
+        tcp:*)      grep -qa "tcp=127.0.0.1" "$PROXY_BIN" 2>/dev/null ;;
+        *)          return 0 ;;   # unknown marker: do not second-guess
+    esac
+}
+
+redeploy_from_module() {
+    [ -x "$MODDIR/su" ] && [ -x "$MODDIR/magisk-proxy" ] || return 1
+    cp "$MODDIR/magisk-proxy" "$PROXY_BIN" && chmod 755 "$PROXY_BIN" || return 1
+    cp "$MODDIR/su" "$SU_BIN" && chmod 755 "$SU_BIN" || return 1
+    # keep every copy the container can reach in lockstep with the module
+    for _dst in /usr/bin/su /usr/local/bin/su; do
+        [ -d "$(dirname "$_dst")" ] && cp "$MODDIR/su" "$_dst" 2>/dev/null && chmod 755 "$_dst" 2>/dev/null
     done
-    if [ "$ALIVE" = 1 ]; then
-        UID_OUT=$(timeout 5 "$SU_BIN" -c 'id -u' 2>/dev/null)
-        # Empty = transient (doze froze the probe). Retry once; if still
-        # empty, LEAVE THE PROXY ALONE — only a confirmed non-zero uid
-        # proves a fake (container-spawned) proxy.
-        if [ -z "$UID_OUT" ]; then
-            sleep 2
-            UID_OUT=$(timeout 8 "$SU_BIN" -c 'id -u' 2>/dev/null)
+    wlog "redeployed binaries from $MODDIR"
+    return 0
+}
+
+start_proxy() {
+    # Keep argv[3] (the magiskd socket) truthful: the proxy does not need it to
+    # serve, but logging a real path makes "socket not found" diagnoses honest.
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$PROXY_BIN" "$1" "$REAL_SOCK" "$PROXY_LOG" "$ALLOW_UID" &
+    else
+        "$PROXY_BIN" "$1" "$REAL_SOCK" "$PROXY_LOG" "$ALLOW_UID" &
+    fi
+}
+
+# v3.12: resolve the magiskd socket once (proxy does not need it to serve;
+# it is logged for honest diagnostics when restarted by the watchdog).
+REAL_SOCK=""
+if command -v magisk >/dev/null 2>&1; then
+    _mt="$(magisk --path 2>/dev/null)"
+    [ -n "$_mt" ] && REAL_SOCK="$_mt/.magisk/device/socket"
+fi
+if [ -z "$REAL_SOCK" ]; then
+    for _d in /debug_ramdisk /sbin; do
+        [ -d "$_d/.magisk" ] && REAL_SOCK="$_d/.magisk/device/socket" && break
+    done
+fi
+[ -z "$REAL_SOCK" ] && REAL_SOCK=/debug_ramdisk/.magisk/device/socket
+
+wlog "watchdog v3.12 loop entered (pid $$)"
+while :; do
+    TR=$(transport_of_marker)
+    if [ -z "$TR" ]; then
+        TR="abstract:termux-root-su"
+        # Log once per marker state change, not every 15s: a persistent gap
+        # (e.g. proxy never wrote the file) must not flood the boot log.
+        if [ "$last_marker_state" != "missing" ]; then
+            wlog "marker missing/unknown; assuming $TR"
+            last_marker_state="missing"
         fi
-        if [ -n "$UID_OUT" ] && [ "$UID_OUT" != "0" ]; then
-            wlog "proxy up but not root (id -u=$UID_OUT), killing fake"
+    else
+        last_marker_state="ok"
+    fi
+
+    # --- 1) deployment self-check (cheap; only when something looks wrong) ---
+    NEED_RESTART=0
+    if ! binary_supports "$TR"; then
+        wlog "MISMATCH: deployed proxy does not support $TR (marker=$(cat "$PORT_FILE" 2>/dev/null)); redeploying"
+        kill_comm_eq "magisk-proxy"
+        sleep 1
+        if redeploy_from_module; then
+            NEED_RESTART=1
+            probe_streak=0
+        else
+            wlog "FATAL: cannot redeploy from $MODDIR (module files missing/not executable)"
+            service_replayed=1
+        fi
+    fi
+
+    if [ "$NEED_RESTART" = 0 ] && ! listening "$TR"; then
+        # Nobody is listening for the transport we recorded.
+        if proxy_running; then
+            wlog "proxy process alive but not listening on $TR; killing it"
             kill_comm_eq "magisk-proxy"
             sleep 1
-            ALIVE=0
         fi
+        NEED_RESTART=1
     fi
-    if [ "$ALIVE" = 0 ]; then
-        # Restart using the recorded transport (abstract by default).
-        MARK=$(cat "$PORT_FILE" 2>/dev/null)
-        case "$MARK" in
-            abstract:*) ARG="@${MARK#abstract:}" ;;
-            [0-9]*)     ARG="$MARK" ;;   # legacy TCP fallback
-            *)          ARG="@termux-root-su" ;;
+
+    if [ "$NEED_RESTART" = 1 ]; then
+        # The proxy argument is derived from the marker, so a wrong marker
+        # would restart the same wrong thing forever; the deployment check
+        # above has already validated support for this transport.
+        case "$TR" in
+            abstract:*) ARG="@${TR#abstract:}" ;;
+            tcp:*)      ARG="${TR#tcp:}" ;;
         esac
-        wlog "proxy down, restarting on $ARG"
-        if command -v setsid >/dev/null 2>&1; then
-            setsid "$PROXY_BIN" "$ARG" "$REAL_SOCK" "$PROXY_LOG" "$ALLOW_UID" &
-        else
-            "$PROXY_BIN" "$ARG" "$REAL_SOCK" "$PROXY_LOG" "$ALLOW_UID" &
-        fi
+        wlog "starting proxy with $ARG"
+        start_proxy "$ARG"
+        probe_streak=0
+        sleep "$sleep_between"
+        continue
     fi
-    sleep 15
+
+    # --- 2) identity probe (is the listener actually serving root?) ---
+    UID_OUT=$(timeout 5 "$SU_BIN" -c 'id -u' 2>/dev/null)
+    if [ -z "$UID_OUT" ]; then
+        sleep 2
+        UID_OUT=$(timeout 8 "$SU_BIN" -c 'id -u' 2>/dev/null)
+    fi
+
+    if [ -n "$UID_OUT" ] && [ "$UID_OUT" != "0" ]; then
+        wlog "proxy up but not root (id -u=$UID_OUT), killing fake (streak=$probe_streak)"
+        kill_comm_eq "magisk-proxy"
+        probe_streak=0
+        sleep 1
+        sleep "$sleep_between"
+        continue
+    fi
+
+    if [ -z "$UID_OUT" ]; then
+        probe_streak=$((probe_streak + 1))
+        wlog "identity probe empty (streak=$probe_streak/$PROBE_FAILS_MAX, transport=$TR)"
+        # A listening proxy that answers no probe is either busy (transient)
+        # or built for another transport. Do NOT kill it on the first empty
+        # result (doze froze the probe hourly on v3.8), but never let the
+        # streak run forever: a persistent empty probe is the signature of
+        # the version mismatch above.
+        if [ "$probe_streak" -ge "$PROBE_FAILS_MAX" ]; then
+            if [ "$service_replayed" = 0 ] && [ -x "$MODDIR/su" ] && [ -x "$MODDIR/magisk-proxy" ]; then
+                # Strongest self-heal first: the module directory is the
+                # authority for BOTH binaries and the transport. A replay runs
+                # the real service.sh (same code path as boot), so marker,
+                # deployment and listener cannot drift apart again. Watchdogs
+                # are wiped by that same run — the replayed service.sh starts a
+                # fresh watchdog, and this instance exits when that succeeds.
+                wlog "streak limit reached; replaying service.sh (deployed binaries may not match $TR)"
+                kill_comm_eq "magisk-proxy"
+                kill_pat "magisk-proxy-wa"
+                sh "$MODDIR/service.sh" >> "$SDLOG" 2>&1
+                sleep 3
+                _u=$(timeout 8 "$SU_BIN" -c 'id -u' 2>/dev/null)
+                if [ "$_u" = "0" ]; then
+                    wlog "replay recovered root (uid=0); exiting, service.sh owns the watchdog"
+                    exit 0
+                fi
+                service_replayed=1
+                probe_streak=0
+                wlog "replay did not restore root (id -u=[$_u])"
+            else
+                # Nothing left to try automatically; make the failure loud
+                # instead of looping. A periodic re-probe still runs so a
+                # transient outage recovers on its own.
+                wlog "FATAL: root proxy not answering after replay; su is BROKEN (transport=$TR, bin_supports=$(binary_supports "$TR" && echo yes || echo no))"
+                last_marker_state=""   # re-announce a still-missing marker
+                probe_streak=0
+            fi
+        fi
+    else
+        # healthy: uid 0
+        [ "$probe_streak" != 0 ] && wlog "identity probe recovered (uid=0)"
+        probe_streak=0
+    fi
+    sleep "$sleep_between"
 done
-WDEOF
+WDOUTER
 chmod 755 "$WD"
-# Substitute the allowed-uid placeholder now that we know it (heredoc is
-# single-quoted, so it was written literally).
-sed -i "s/__ALLOW_UID__/${TERMUX_UID:-0}/" "$WD"
-# v3.9: kill stale watchdogs first. Multiple watchdogs war over the proxy
-# (each probes via su; a transient empty probe makes one kill the shared
-# proxy, the others race to respawn it -> 4 proxies squatting 48000-48003
-# and flapping su). Newest service.sh run must own the watchdog role alone.
-kill_pat "magisk-proxy-wa"
-sleep 1
-# toybox on some ROMs lacks setsid; fall back to plain nohup.
-if command -v setsid >/dev/null 2>&1; then
-    setsid nohup "$WD" >/dev/null 2>&1 &
-else
-    nohup "$WD" >/dev/null 2>&1 &
-fi
+# Substitute the two placeholders (the heredoc is single-quoted on purpose).
+sed -i "s|__ALLOW_UID__|${TERMUX_UID:-0}|; s|__MODDIR__|$MODDIR|" "$WD"
 log "watchdog started (pid $!)"
 
 log "=== service.sh done ==="

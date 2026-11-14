@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# termux-root-su v3.8 boot-completed.sh
+# termux-root-su v3.11 boot-completed.sh
 # Second-chance supervisor: run service.sh once CE storage is actually
 # unlocked, then verify a ROOT proxy is listening.
 #
@@ -30,7 +30,7 @@ log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') [boot-completed] $*" >> "$SDLOG" 2>/dev/null
 }
 
-log "=== boot-completed v3.8 start ==="
+log "=== boot-completed v3.11 start ==="
 
 # --- Wait for CE unlock (Termux data becomes readable only after unlock) ---
 TERMUX_DATA=""
@@ -60,13 +60,16 @@ verify_root() {
 }
 
 if verify_root; then
-    log "root proxy already healthy on port $(cat "$PORT_FILE" 2>/dev/null)"
+    log "root proxy already healthy (transport=$(cat "$PORT_FILE" 2>/dev/null))"
     exit 0
 fi
 
 log "no working root proxy; running service.sh"
 if [ -f "$MODDIR/service.sh" ]; then
-    sh "$MODDIR/service.sh" >> "$LOG" 2>/dev/null
+    # Bound the replay: service.sh waits up to 240s for CE unlock plus proxy
+    # startup. An unbounded call here would hold boot-completed open forever
+    # if it wedged, and the watchdog would then never be spawned by anyone.
+    timeout 420 sh "$MODDIR/service.sh" >> "$LOG" 2>/dev/null
 else
     log "FATAL: $MODDIR/service.sh missing — module not installed"
     exit 1
@@ -79,7 +82,7 @@ for i in 1 2 3 4 5 6; do
     verify_root && { ok=1; break; }
 done
 if [ "$ok" = 1 ]; then
-    log "OK: root proxy serving su on port $(cat "$PORT_FILE" 2>/dev/null)"
+    log "OK: root proxy serving su (transport=$(cat "$PORT_FILE" 2>/dev/null))"
 else
     log "FAILED: su still not returning uid 0 after service.sh"
     tail -5 "$TERMUX_TMP/magisk-proxy.log" >> "$LOG" 2>/dev/null

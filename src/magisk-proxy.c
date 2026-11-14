@@ -258,6 +258,13 @@ static void handle_connection(int cfd) {
     int exit_code = 1;
     int child_waited = 0;
 
+    /* Separate buffers for stdout and stderr: within one poll round BOTH
+     * streams may have data, and each is coalesced then sent as its own frame;
+     * they must not share storage. stdin is written straight from the socket
+     * read buffer and needs none. */
+    static char relay_buf[RELAY_BUF_SIZE];
+    static char relay_buf_err[RELAY_BUF_SIZE];
+    char *buf_out = relay_buf, *buf_err = relay_buf_err;
     while (interactive ? !stdout_closed : !(stdout_closed && stderr_closed)) {
         int nfds = interactive ? 2 : 3;
         int ret = poll(fds, nfds, 5000);
@@ -334,7 +341,7 @@ static void handle_connection(int cfd) {
 
         /* Client → child stdin (raw, no framing) */
         if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
-            char buf[RELAY_BUF_SIZE];
+            char *buf = relay_buf;
             ssize_t n = read(cfd, buf, sizeof(buf));
             if (n < 0) {
                 client_gone = 1;
@@ -382,34 +389,65 @@ static void handle_connection(int cfd) {
 
         /* Child stdout → client (framed) */
         if (fds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
-            char buf[RELAY_BUF_SIZE];
-            ssize_t n = interactive
-                ? read(master, buf, sizeof(buf))
-                : read(stdout_pipe[0], buf, sizeof(buf));
-            if (n <= 0) {
-                stdout_closed = 1;
-                fds[1].fd = -1; fds[1].events = 0;
+            char *buf = buf_out;
+            /* v3.10 PERF: cat/pipe delivers data in tiny chunks (observed 8
+             * bytes/frame); sending each as its own frame + header made a
+             * 1MB transfer cost ~2s in proot (an extra syscall round-trip per
+             * frame). Coalesce: keep reading until the buffer is full or the
+             * pipe would block (EAGAIN), then send ONE frame. For a real pty
+             * (interactive) keep the single-read behaviour — batching tty
+             * output can delay echoes. */
+            ssize_t total = 0;
+            if (interactive) {
+                total = read(master, buf, RELAY_BUF_SIZE);
+            } else {
+                int pfl = fcntl(stdout_pipe[0], F_GETFL, 0);
+                fcntl(stdout_pipe[0], F_SETFL, pfl | O_NONBLOCK);
+                while (total < RELAY_BUF_SIZE) {
+                    ssize_t r = read(stdout_pipe[0], buf + total, RELAY_BUF_SIZE - total);
+                    if (r > 0) { total += r; continue; }
+                    if (r < 0 && errno == EINTR) continue;
+                    if (r < 0 && errno == EAGAIN) break;  /* drained for now */
+                    if (r == 0) { /* EOF: mark closed, but still send what we have */
+                        stdout_closed = 1; fds[1].fd = -1; fds[1].events = 0;
+                        break;
+                    }
+                    break;
+                }
+                fcntl(stdout_pipe[0], F_SETFL, pfl);
+            }
+            if (total <= 0) {
+                if (!interactive) { stdout_closed = 1; fds[1].fd = -1; fds[1].events = 0; }
             } else if (!client_gone) {
-                if (send_frame(cfd, buf, (uint32_t)n) < 0) {
-                    /* Client is gone (write failed). The child may keep
-                     * running (e.g. sleep) — kill it so this connection
-                     * never lingers. */
+                if (send_frame(cfd, buf, (uint32_t)total) < 0) {
                     client_gone = 1;
                     kill(child, SIGTERM);
                     break;
                 }
+            } else if (total > 0) {
+                /* client gone but we must handle EOF flags; nothing to send */
             }
         }
 
         /* Child stderr → client (framed, non-interactive only) */
         if (!interactive && (fds[2].revents & (POLLIN | POLLHUP | POLLERR))) {
-            char buf[RELAY_BUF_SIZE];
-            ssize_t n = read(stderr_pipe[0], buf, sizeof(buf));
-            if (n <= 0) {
-                stderr_closed = 1;
-                fds[2].fd = -1; fds[2].events = 0;
+            char *buf = buf_err;
+            ssize_t total = 0;
+            int pfl = fcntl(stderr_pipe[0], F_GETFL, 0);
+            fcntl(stderr_pipe[0], F_SETFL, pfl | O_NONBLOCK);
+            while (total < RELAY_BUF_SIZE) {
+                ssize_t r = read(stderr_pipe[0], buf + total, RELAY_BUF_SIZE - total);
+                if (r > 0) { total += r; continue; }
+                if (r < 0 && errno == EINTR) continue;
+                if (r < 0 && errno == EAGAIN) break;
+                if (r == 0) { stderr_closed = 1; fds[2].fd = -1; fds[2].events = 0; break; }
+                break;
+            }
+            fcntl(stderr_pipe[0], F_SETFL, pfl);
+            if (total <= 0) {
+                if (total == 0 && !stderr_closed) { stderr_closed = 1; fds[2].fd = -1; fds[2].events = 0; }
             } else if (!client_gone) {
-                if (send_frame(cfd, buf, (uint32_t)n) < 0) {
+                if (send_frame(cfd, buf, (uint32_t)total) < 0) {
                     client_gone = 1;
                     kill(child, SIGTERM);
                     break;
@@ -452,7 +490,9 @@ static void handle_connection(int cfd) {
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <proxy-sock> [unused] [log-path]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <proxy-sock> [unused] [log-path] [allow-uid]\n"
+                        "       %s --probe <@name|abstract:name|tcp:PORT|PORT>\n",
+                argv[0], argv[0]);
         return 1;
     }
 
@@ -468,6 +508,59 @@ int main(int argc, char *argv[]) {
 
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, on_sigchld);
+
+    /* v3.12: `--probe <transport>` answers "is somebody already serving this
+     * transport?" without reading /proc/net (many Android builds deny
+     * /proc/net/unix to non-root, so the table is not a reliable oracle).
+     * argv[2] accepts "@name" or "tcp:<port>" (also accepted: "abstract:name"
+     * and a bare port, so callers can pass the marker verbatim).
+     * Exit 0 = in use (EADDRINUSE), 1 = free, 2 = usage error. */
+    if (argc >= 3 && strcmp(argv[1], "--probe") == 0) {
+        const char *t = argv[2];
+        int is_abstract = 0;
+        int is_port = 0;
+        long pport = 0;
+        if (t[0] == '@') {
+            is_abstract = 1;
+            t += 1;
+        } else if (strncmp(t, "abstract:", 9) == 0) {
+            is_abstract = 1;
+            t += 9;
+        } else {
+            if (strncmp(t, "tcp:", 4) == 0) t += 4;
+            char *pe = NULL;
+            pport = strtol(t, &pe, 10);
+            if (pe == t || *pe != '\0' || pport <= 0 || pport > 65535) return 2;
+            is_port = 1;
+        }
+        if (is_abstract) {
+            int ps = socket(AF_UNIX, SOCK_STREAM, 0);
+            if (ps < 0) return 2;
+            struct sockaddr_un pa;
+            memset(&pa, 0, sizeof(pa));
+            pa.sun_family = AF_UNIX;
+            size_t pn = strlen(t);
+            int rc;
+            if (pn >= sizeof(pa.sun_path) - 1) {
+                close(ps);
+                return 2;
+            }
+            memcpy(pa.sun_path + 1, t, pn);
+            rc = bind(ps, (struct sockaddr *)&pa,
+                      (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + pn));
+            { int e = errno; close(ps); return (rc < 0 && e == EADDRINUSE) ? 0 : 1; }
+        }
+        if (is_port) {
+            int ps = socket(AF_INET, SOCK_STREAM, 0);
+            if (ps < 0) return 2;
+            struct sockaddr_in pa = { .sin_family = AF_INET };
+            pa.sin_port = htons((uint16_t)pport);
+            pa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            int rc = bind(ps, (struct sockaddr *)&pa, sizeof(pa));
+            { int e = errno; close(ps); return (rc < 0 && e == EADDRINUSE) ? 0 : 1; }
+        }
+        return 2;
+    }
 
     /* v3.3: TCP loopback mode — argv[1] as numeric port = 127.0.0.1:port.
      * proot hijacks unix socket paths (virtual bind + proot-* temp files),
@@ -492,7 +585,7 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         listen(srv, 10);
-        log_msg("magisk-proxy v3.6 started (pid %d, uid %d) tcp=127.0.0.1:%ld",
+        log_msg("magisk-proxy v3.12 started (pid %d, uid %d) tcp=127.0.0.1:%ld",
                 getpid(), getuid(), port);
     } else if (sock_path[0] == '@') {
         /* v3.10 SECURITY: abstract-namespace unix socket (Linux: sun_path[0]
@@ -513,11 +606,14 @@ int main(int argc, char *argv[]) {
         memcpy(addr.sun_path + 1, sock_path + 1, nlen);
         socklen_t alen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + nlen);
         if (bind(srv, (struct sockaddr *)&addr, alen) < 0) {
-            log_msg("bind(@%s) failed: %s", sock_path + 1, strerror(errno));
+            int e = errno;
+            log_msg("bind(@%s) failed: %s%s", sock_path + 1, strerror(e),
+                    e == EADDRINUSE ? " — another proxy already serves this name;"
+                                      " kill it or use the running one" : "");
             return 1;
         }
         listen(srv, 10);
-        log_msg("magisk-proxy v3.10 started (pid %d, uid %d) abstract=@%s",
+        log_msg("magisk-proxy v3.12 started (pid %d, uid %d) abstract=@%s",
                 getpid(), getuid(), sock_path + 1);
     } else {
         srv = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -531,7 +627,7 @@ int main(int argc, char *argv[]) {
         }
         listen(srv, 10);
         chmod(sock_path, 0600);   /* v3.10: was 0666 — no reason to world-write */
-        log_msg("magisk-proxy v3.10 started (pid %d, uid %d) sock=%s",
+        log_msg("magisk-proxy v3.12 started (pid %d, uid %d) sock=%s",
                 getpid(), getuid(), sock_path);
     }
 

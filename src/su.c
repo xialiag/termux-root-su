@@ -1,5 +1,5 @@
 /*
- * su v3.4 — custom su client for relay-based magisk-proxy.
+ * su v3.12 — custom su client for relay-based magisk-proxy.
  *
  * Uses frame protocol: uint32 length + data[length].
  * length=0 means end-of-relay, followed by uint32 exit_code.
@@ -85,44 +85,33 @@ int main(int argc, char *argv[]) {
         cmd = argv[1];
         interactive = 0;
     }
+    /* The wire protocol uses cmd_len==0 to mean "interactive shell". An
+     * explicit empty command (`su -c ''`) must NOT be mistaken for that, so
+     * turn it into a shell no-op (":"); otherwise su drops into a prompt. */
+    if (!interactive && (cmd == NULL || cmd[0] == '\0'))
+        cmd = ":";
 
     signal(SIGPIPE, SIG_IGN);
 
-    /* Read port from port files (hint only; the container may not see the
-     * host path, so we scan the whole range as fallback) */
-    int hint_port = 0;
-    const char *port_files[] = { PORT_FILE, PORT_FILE_ALT, NULL };
-    for (int i = 0; port_files[i]; i++) {
-        FILE *pf = fopen(port_files[i], "r");
-        if (!pf) continue;
-        char buf[16] = "";
-        if (fgets(buf, sizeof(buf), pf)) {
-            int p = atoi(buf);
-            if (p >= DEFAULT_PORT && p < 65536) { hint_port = p; break; }
-        }
-        fclose(pf);
-    }
-
-    /* Connect to proxy over TCP loopback (no proot path translation).
-     * Try hint first, then scan DEFAULT_PORT..PORT_SCAN_END-1.
-     * Each candidate gets a short handshake timeout (normal proxy responds
-     * within ms); dead listeners (stale processes that accept but never
-     * answer) are skipped quickly instead of hanging 5s per port. */
     uint32_t cmd_len = cmd ? (uint32_t)strlen(cmd) : 0;
     uint32_t child_pid = 0;
     int sock = -1;
 
-    /* v3.10 SECURITY: prefer the abstract-namespace unix socket, which the
-     * proxy can authenticate via SO_PEERCRED (TCP loopback cannot). proot does
-     * not hijack abstract names, so this works inside the container. If it is
-     * not listening we fall back to the legacy TCP port scan below. */
+    /* v3.10: try the abstract-namespace unix socket FIRST and, on success,
+     * never touch the port files at all — this is the hot path, and in proot
+     * every open()/exec() is expensive (two fopen of the port file cost ~20ms
+     * per su invocation). The proxy authenticates via SO_PEERCRED here. */
     {
         int s = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (s >= 0) {
+        const char *an = getenv("TRSU_SOCK");
+        if (!an || !*an) an = "termux-root-su";
+        /* sun_path holds 108 bytes; an over-long name would overrun it (the
+         * name comes from the environment). Skip the abstract path entirely
+         * and let the legacy TCP scan below handle the connection. */
+        if (s >= 0 && strlen(an) < sizeof(((struct sockaddr_un *)0)->sun_path) - 1) {
             struct sockaddr_un ua;
             memset(&ua, 0, sizeof(ua));
             ua.sun_family = AF_UNIX;
-            const char *an = "termux-root-su";
             size_t nlen = strlen(an);
             memcpy(ua.sun_path + 1, an, nlen);
             socklen_t alen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + nlen);
@@ -138,66 +127,79 @@ int main(int argc, char *argv[]) {
             } else {
                 close(s);
             }
+        } else if (s >= 0) {
+            close(s);
         }
     }
 
-    int ports[PORT_SCAN_END - DEFAULT_PORT];
-    int nports = 0;
+    /* === TCP fallback (only if the abstract socket was unavailable) ===
+     * Legacy transport with no peer auth. Read the port-file hint here, not
+     * before, so the abstract hot path pays nothing for it. */
     if (sock < 0) {
-    if (hint_port >= DEFAULT_PORT && hint_port < PORT_SCAN_END)
-        ports[nports++] = hint_port;
-    for (int p = DEFAULT_PORT; p < PORT_SCAN_END; p++)
-        if (p != hint_port) ports[nports++] = p;
+        int hint_port = 0;
+        const char *port_files[] = { PORT_FILE, PORT_FILE_ALT, NULL };
+        for (int i = 0; port_files[i]; i++) {
+            FILE *pf = fopen(port_files[i], "r");
+            if (!pf) continue;
+            char buf[16] = "";
+            if (fgets(buf, sizeof(buf), pf)) {
+                int p = atoi(buf);
+                if (p >= DEFAULT_PORT && p < 65536) { hint_port = p; fclose(pf); break; }
+            }
+            fclose(pf);
+        }
 
-    for (int i = 0; i < nports && sock < 0; i++) {
-        int p = ports[i];
-        int s = socket(AF_INET, SOCK_STREAM, 0);
-        if (s < 0) break;
-        struct sockaddr_in addr;
-        memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons((uint16_t)p);
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        /* Non-blocking connect with a short timeout: a stale listener that
-         * swallows SYNs (kernel retries can hang a blocking connect for
-         * tens of seconds) must not stall the scan. */
-        int fl = fcntl(s, F_GETFL, 0);
-        fcntl(s, F_SETFL, fl | O_NONBLOCK);
-        int cr = connect(s, (struct sockaddr *)&addr, sizeof(addr));
-        if (cr != 0 && errno != EINPROGRESS) {
-            close(s);
-            continue;
+        int ports[PORT_SCAN_END - DEFAULT_PORT];
+        int nports = 0;
+        if (hint_port >= DEFAULT_PORT && hint_port < PORT_SCAN_END)
+            ports[nports++] = hint_port;
+        for (int p = DEFAULT_PORT; p < PORT_SCAN_END; p++)
+            if (p != hint_port) ports[nports++] = p;
+
+        for (int i = 0; i < nports && sock < 0; i++) {
+            int p = ports[i];
+            int s = socket(AF_INET, SOCK_STREAM, 0);
+            if (s < 0) break;
+            struct sockaddr_in addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons((uint16_t)p);
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            /* Non-blocking connect with a short timeout: a stale listener that
+             * swallows SYNs must not stall the scan. */
+            int fl = fcntl(s, F_GETFL, 0);
+            fcntl(s, F_SETFL, fl | O_NONBLOCK);
+            int cr = connect(s, (struct sockaddr *)&addr, sizeof(addr));
+            if (cr != 0 && errno != EINPROGRESS) {
+                close(s);
+                continue;
+            }
+            struct pollfd cfd2 = { .fd = s, .events = POLLOUT };
+            if (poll(&cfd2, 1, 1000) <= 0) {
+                close(s);
+                continue;
+            }
+            int soerr = 0;
+            socklen_t slen = sizeof(soerr);
+            getsockopt(s, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+            if (soerr != 0) {
+                close(s);
+                continue;
+            }
+            fcntl(s, F_SETFL, fl); /* back to blocking for the relay */
+            if (write(s, &cmd_len, 4) != 4 ||
+                (cmd_len > 0 && write(s, cmd, cmd_len) != (ssize_t)cmd_len)) {
+                close(s);
+                continue;
+            }
+            struct pollfd pfd = { .fd = s, .events = POLLIN };
+            if (poll(&pfd, 1, 1000) <= 0 || xxread(s, &child_pid, 4) < 0) {
+                close(s);
+                continue;
+            }
+            sock = s;
         }
-        struct pollfd cfd2 = { .fd = s, .events = POLLOUT };
-        int cpret = poll(&cfd2, 1, 1000); /* 1s per candidate */
-        if (cpret <= 0) {
-            close(s);
-            continue;
-        }
-        int soerr = 0;
-        socklen_t slen = sizeof(soerr);
-        getsockopt(s, SOL_SOCKET, SO_ERROR, &soerr, &slen);
-        if (soerr != 0) {
-            close(s);
-            continue;
-        }
-        fcntl(s, F_SETFL, fl); /* back to blocking for the relay */
-        /* Send cmd_len + cmd */
-        if (write(s, &cmd_len, 4) != 4 ||
-            (cmd_len > 0 && write(s, cmd, cmd_len) != (ssize_t)cmd_len)) {
-            close(s);
-            continue;
-        }
-        /* Read child_pid (short timeout; skip dead listeners) */
-        struct pollfd pfd = { .fd = s, .events = POLLIN };
-        int pret = poll(&pfd, 1, 1000); /* 1s per candidate */
-        if (pret <= 0 || xxread(s, &child_pid, 4) < 0) {
-            close(s);
-            continue;
-        }
-        sock = s;
     }
-    } /* end if (sock < 0) TCP fallback */
 
     if (sock < 0) {
         fprintf(stderr,

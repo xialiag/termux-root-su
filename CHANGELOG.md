@@ -1,5 +1,56 @@
 # CHANGELOG
 
+## v3.12 (2026-11-14)
+
+### 修复：watchdog 版本错配死循环（su 静默死亡 3 天）
+现象：容器内 `su -c id` 报 `Cannot connect to daemon (127.0.0.1:48000-48019)`，
+`trsu-boot.log` 里 1515 条 `port open but not root (id -u=), killing fake` →
+`proxy down, restarting on 48000`，su 从 2026-11-11 起全程不可用而无人察觉。
+
+根因链（三条独立缺陷叠加）：
+1. **部署/标记错配**。`service.sh` v3.10 把 `abstract:termux-root-su` 写入
+   `magisk-proxy.port`，但机器上实际部署的是 v3.9 TCP-only 二进制——它按
+   numeric 端口起监听，抽象名永远绑不上，日志只见 `tcp=127.0.0.1:48000`。
+2. **watchdog 只看进程名 + 身份探测**。存活判据是「有 comm=`magisk-proxy`
+   的进程」+「`su -c 'id -u'` 返回 0」。旧 TCP 客户端连不上抽象 marker，
+   探测输出**恒为空**；而空输出按 v3.8 设计被当作 doze 瞬态「放过不杀」，
+   于是既不杀也不启，循环空转。
+3. **探测空 = 无信息**。原逻辑无法区分「代理忙/系统冻结」与「代理根本是
+   另一个传输层版本」，所以 3 天里没有任何一条日志说明真正原因。
+
+修复（`service.sh` 内嵌 watchdog 重写为 v3.12）：
+- **`magisk-proxy --probe <transport>`**：新增探针模式，直接 `bind()` 判定
+  目标传输是否已被占用（`EADDRINUSE` = 在监听），**不读 `/proc/net`**——
+  Android 常对非 root 拒绝 `/proc/net/unix`，表格法会静默误报「无人监听」
+  并导致重复 spawn → 全部 `Address in use` 死掉。支持 `@name` /
+  `abstract:name` / `tcp:PORT` / 裸端口四种写法。
+- **二进制/传输自检**：watchdog 每轮比较 `PORT_FILE` 里的 marker 与部署的
+  proxy 二进制是否真的支持该传输（在 .text 里找启动日志串
+  `abstract=@` / `tcp=127.0.0.1`）；不匹配立刻从 `$MODDIR` 重新部署并重启，
+  不再重复重启同一对错配组合。
+- **探测连续失败熔断**：连续 `PROBE_FAILS_MAX`(4) 次身份探测为空时，先原地
+  重放 `service.sh`（与开机同一代码路径，会把 marker、二进制、监听三者对齐），
+  重放后仍失败则打印明确 FATAL（含推荐恢复命令）而不是继续空转。
+- **watchdog 重放 service.sh 后自退**：`service.sh` 会清掉旧 watchdog 并
+  起新的，自退避免「多个 watchdog 争抢代理」（v3.9 曾出现 4 个 proxy 抢
+  48000-48003）。
+- **`start_proxy` 参数传递修正**：原 `setsid $_raw &` 依赖 shell 分词，路径
+  含空格会错位；改为逐参数引号传递，并把真实 magiskd socket 作为 argv[3]
+  传出（proxy 不强依赖，但日志诊断更诚实）。
+- **`service.sh` 的 `MODDIR` 转为绝对路径**（相对调用时重部署会失败）。
+- **`boot-completed.sh`**：健康/成功日志改用 `transport=` 而非 `port=`，
+  避免 abstract 模式打印空端口。
+
+验证（本地沙箱，`/tmp/wdtest`，真实 v3.9 二进制 + v3.12 模块目录）：
+- 错配场景：日志 `MISMATCH: deployed proxy does not support
+  abstract:termux-root-su ... redeploying` → 二进制覆盖 → 起代理一次成功，
+  `su -c 'id -u'` 返回 `0`。
+- 正常态：watchdog 完全静默（0 行写入），无重启。
+- marker 缺失：自动推断 `abstract:termux-root-su` 并恢复。
+- TCP legacy 传输：按 marker 启动 `tcp=127.0.0.1:PORT` 正常服务。
+- 大输出：500KB / 1MB `cat` 逐字节对拍（md5 + cmp）一致；exit code、
+  stderr 分流、8 路并发、`head -c` 触发 SIGPIPE、交互 pty 全部通过。
+
 ## v3.10 (2026-11-08)
 - **安全：消除本地提权面（高危）**。原来 proxy 监听 `127.0.0.1:48000`，TCP
   无法识别对端，**设备上任意 app 都能连上并执行任意 root 命令**（日志/实测

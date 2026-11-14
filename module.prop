@@ -1,6 +1,6 @@
 id=termux-root-su
 name=Termux Root SU
-version=v3.10
-versionCode=3100
+version=v3.12
+versionCode=3120
 author=AgentDev
-description=Real root for proot containers via an AUTHENTICATED abstract-unix-socket proxy (SO_PEERCRED: only Termux uid/root); fixes su output truncation and kill_pat hang/slowness
+description=Real root for proot containers via an AUTHENTICATED abstract-unix-socket proxy (SO_PEERCRED); v3.12 watchdog self-heals transport/binary version mismatch (2026-11-14 incident: 1515-iteration kill/restart loop left su dead for 3 days)
