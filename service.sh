@@ -33,7 +33,7 @@ log() {
     # silently fail before that, which is expected.
     echo "$(date '+%Y-%m-%d %H:%M:%S') [service] $*" >> "$SDLOG" 2>/dev/null
 }
-log "=== service.sh v3.12 starting ==="
+log "=== service.sh v3.12.2 starting ==="
 # kill_pat <comm-substr>: kill -9 processes whose /proc/<pid>/comm contains
 # <comm-substr>. pkill/killall are NOT usable on this ROM (toybox pkill -x
 # kills nothing; Termux killall prefix-matches the watchdog comm and dragged
@@ -114,16 +114,48 @@ fi
 # the unlock itself, so a long ceiling costs nothing when CE is already
 # unlocked. Log progress every 30s to sdcard so the failure is visible.
 TERMUX_DATA=""
-for i in $(seq 1 240); do
-    for d in /data/data/com.termux /data/user/0/com.termux; do
-        [ -d "$d/files/usr/bin" ] && TERMUX_DATA="$d" && break
+if [ "$TRSU_CE_WAITER" = "1" ]; then
+    # v3.12.2 waiter mode: re-entered with CE already close to unlock; wait
+    # WITHOUT a ceiling. The 2026-11-15 03:18 reboot happened while the screen
+    # was locked; the 240s ceiling expired before the user woke up, service.sh
+    # exited, and NOTHING ever retried — su stayed dead all day (zero log
+    # lines, because /sdcard FUSE is also invisible while CE is locked).
+    # The waiter logs once per 10min so a long lock is still visible once
+    # /sdcard becomes readable.
+    i=0
+    while [ -z "$TERMUX_DATA" ]; do
+        for d in /data/data/com.termux /data/user/0/com.termux; do
+            [ -d "$d/files/usr/bin" ] && TERMUX_DATA="$d" && break
+        done
+        if [ -z "$TERMUX_DATA" ]; then
+            i=$((i + 1))
+            [ $((i % 10)) -eq 0 ] && log "CE waiter: still locked (${i}min)"
+            sleep 60
+        fi
     done
-    [ -n "$TERMUX_DATA" ] && break
-    [ $((i % 30)) -eq 0 ] && log "still waiting for CE unlock (${i}s)"
-    sleep 1
-done
+    log "CE waiter: unlock detected after ${i}min; resuming service.sh"
+else
+    for i in $(seq 1 240); do
+        for d in /data/data/com.termux /data/user/0/com.termux; do
+            [ -d "$d/files/usr/bin" ] && TERMUX_DATA="$d" && break
+        done
+        [ -n "$TERMUX_DATA" ] && break
+        [ $((i % 30)) -eq 0 ] && log "still waiting for CE unlock (${i}s)"
+        sleep 1
+    done
+fi
 if [ -z "$TERMUX_DATA" ]; then
-    log "FATAL: Termux not found after 240s (CE still locked?)"; exit 1
+    # v3.12.2: do NOT give up. Spawn a detached waiter that re-enters this
+    # script in waiter mode (unlimited CE wait) and exit. Magisk marks the
+    # service failed — fine; the waiter is the recovery path.
+    log "FATAL: Termux not found after 240s (CE still locked?); spawning CE waiter"
+    if command -v setsid >/dev/null 2>&1; then
+        TRSU_CE_WAITER=1 setsid nohup sh "$0" >/dev/null 2>&1 &
+    else
+        TRSU_CE_WAITER=1 nohup sh "$0" >/dev/null 2>&1 &
+    fi
+    log "CE waiter spawned; service.sh exiting (waiter owns recovery)"
+    exit 1
 fi
 TERMUX_TMP="$TERMUX_DATA/files/usr/tmp"
 log "Termux: $TERMUX_DATA"
@@ -307,7 +339,7 @@ done
 WD="$TERMUX_TMP/magisk-proxy-watchdog.sh"
 cat > "$WD" <<'WDOUTER'
 #!/system/bin/sh
-# termux-root-su v3.12 watchdog — keep a ROOT magisk-proxy listening.
+# termux-root-su v3.12.2 watchdog — keep a ROOT magisk-proxy listening.
 PORT_FILE=/data/data/com.termux/files/usr/tmp/magisk-proxy.port
 PROXY_LOG=/data/data/com.termux/files/usr/tmp/magisk-proxy.log
 SDLOG=/sdcard/Download/trsu-boot.log
@@ -438,8 +470,17 @@ if [ -z "$REAL_SOCK" ]; then
 fi
 [ -z "$REAL_SOCK" ] && REAL_SOCK=/debug_ramdisk/.magisk/device/socket
 
-wlog "watchdog v3.12 loop entered (pid $$)"
+_hb_next=0
+wlog "watchdog v3.12.2 loop entered (pid $$)"
 while :; do
+    # v3.12.2 liveness heartbeat: the 2026-11-14/15 outage killed this
+    # watchdog silently after 19:36 (no log, no process) and NOTHING could
+    # date its death. One line per hour (plus one on entry) fixes that.
+    _hb_now=$(date +%s 2>/dev/null || echo 0)
+    if [ "${_hb_now:-0}" -ge "${_hb_next:-0}" ]; then
+        wlog "heartbeat alive (pid $$)"
+        _hb_next=$((_hb_now + 3600))
+    fi
     TR=$(transport_of_marker)
     if [ -z "$TR" ]; then
         TR="abstract:termux-root-su"
@@ -594,6 +635,67 @@ else
         log "watchdog started (pid $WD_PID)"
     else
         log "FATAL: watchdog did NOT start; su will not self-heal. Run tools/trsu-restart3.sh as host root"
+    fi
+
+    # v3.12.2 patrol: the watchdog itself died silently on 2026-11-14
+    # (19:36:21 last line, process gone) and nobody noticed for 19h. A slow
+    # second-line guard (5min period, ~zero battery) re-runs service.sh when
+    # BOTH the watchdog and the proxy are gone. It must not fight a healthy
+    # watchdog: any live magisk-proxy* comm short-circuits it.
+    PATROL="$TERMUX_TMP/magisk-proxy-patrol.sh"
+    cat > "$PATROL" <<'PATROLOUTER'
+#!/system/bin/sh
+# termux-root-su v3.12.2 patrol — second-line guard for the watchdog itself.
+LOG2=/data/data/com.termux/files/usr/tmp/magisk-proxy.log
+SDLOG=/sdcard/Download/trsu-boot.log
+plog() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [patrol] $*" >> "$LOG2" 2>/dev/null
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [patrol] $*" >> "$SDLOG" 2>/dev/null
+}
+plog "patrol loop entered (pid $$)"
+_hb=0
+while :; do
+    _now=$(date +%s 2>/dev/null || echo 0)
+    if [ "${_now:-0}" -ge "${_hb:-0}" ]; then
+        plog "heartbeat alive (pid $$)"
+        _hb=$((_now + 3600))
+    fi
+    live=0
+    for _d in /proc/[0-9]*; do
+        { read -r _c < "$_d/comm"; } 2>/dev/null || continue
+        case "$_c" in magisk-proxy*) live=1; break ;; esac
+    done
+    if [ "$live" = 0 ]; then
+        plog "watchdog+proxy BOTH dead; replaying service.sh"
+        sh /data/adb/modules/termux-root-su/service.sh >> "$SDLOG" 2>&1
+        plog "patrol replay returned; resuming watch"
+    fi
+    sleep 300
+done
+PATROLOUTER
+    chmod 755 "$PATROL"
+    # single patrol owner: newest run replaces any stale patrol
+    for _d in /proc/[0-9]*; do
+        _pid="${_d#/proc/}"
+        [ "$_pid" = "$$" ] && continue
+        { read -r _c < "$_d/comm"; } 2>/dev/null || continue
+        [ "$_c" = "magisk-proxy-pa" ] && kill -9 "$_pid" 2>/dev/null
+    done
+    if command -v setsid >/dev/null 2>&1; then
+        setsid nohup sh "$PATROL" >/dev/null 2>&1 &
+    else
+        nohup sh "$PATROL" >/dev/null 2>&1 &
+    fi
+    sleep 2
+    PT_PID=""
+    for _d in /proc/[0-9]*; do
+        { read -r _c < "$_d/comm"; } 2>/dev/null || continue
+        [ "$_c" = "magisk-proxy-pa" ] && PT_PID="${_d#/proc/}" && break
+    done
+    if [ -n "$PT_PID" ]; then
+        log "patrol started (pid $PT_PID)"
+    else
+        log "WARN: patrol did not start (second-line guard missing)"
     fi
 fi
 

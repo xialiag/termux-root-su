@@ -1,6 +1,6 @@
 id=termux-root-su
 name=Termux Root SU
-version=v3.12.1
-versionCode=3121
+version=v3.12.2
+versionCode=3122
 author=AgentDev
-description=Real root for proot containers via an AUTHENTICATED abstract-unix-socket proxy (SO_PEERCRED); v3.12.1 restores the watchdog launch block that v3.12 accidentally deleted, and reports the real watchdog pid (was logging the proxy's)
+description=Real root for proot containers via an AUTHENTICATED abstract-unix-socket proxy (SO_PEERCRED); v3.12.2: locked-CE reboot no longer kills recovery (CE waiter re-enters service.sh without a ceiling) and a 5-min patrol restarts everything if the watchdog itself dies
