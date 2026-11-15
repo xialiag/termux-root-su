@@ -192,13 +192,13 @@ for rootfs in "$TERMUX_DATA/files/usr/var/lib/proot-distro/containers"/*/rootfs;
     log "deployed su -> $rootfs/usr/local/bin/su"
 done
 
-# --- Deploy bashrc probe snippet (probe only, NO container-side spawn) ---
-# A container-spawned proxy runs as the Termux uid (fake root) and squats
-# the port; the host watchdog verifies identity and kills it. The snippet
-# just probes and tells the user where to restart the proxy.
+# --- Deploy bashrc probe+recover snippet (host-side recovery entry) ---
 # v3.8: replace any existing block (marker-delimited) instead of skipping,
 # so the hint text upgrades across versions without stacking duplicates.
-SNIP_MARK="termux-root-su v3.10: proxy probe"
+# v3.12.2: the snippet now RECOVERS, not just hints: when the transport is
+# dead it replays service.sh via MagiskSU (debounced 10min). This is the
+# last-resort guard — the user's own next Termux session heals su.
+SNIP_MARK="termux-root-su v3.12.2: probe+recover"
 for rootfs in "$TERMUX_DATA/files/usr/var/lib/proot-distro/containers"/*/rootfs; do
     [ -f "$rootfs/root/.bashrc" ] || continue
     if grep -q "# ===== termux-root-su v3" "$rootfs/root/.bashrc" 2>/dev/null; then
